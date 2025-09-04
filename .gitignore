@@ -1,0 +1,5 @@
+build
+.vscode
+src_backup
+test
+weights
