@@ -1,9 +1,6 @@
 #include "InferenceEngine.h"
-
 #include <QPainter>
 #include <QDebug>
-#include <QFile>
-#include <QTextStream>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -12,65 +9,58 @@
 #include <onnxruntime_cxx_api.h>
 #endif
 
-// ====================== 辅助函数（匿名命名空间） ======================
 namespace
 {
 
     inline float sigmoid(float x) { return 1.f / (1.f + std::exp(-x)); }
 
-    struct Det
+    struct Box
     {
         float x1, y1, x2, y2, score;
         int cls;
     };
 
-    inline float iou(const Det &a, const Det &b)
+    inline float IoU(const Box &a, const Box &b)
     {
         const float xx1 = std::max(a.x1, b.x1);
         const float yy1 = std::max(a.y1, b.y1);
         const float xx2 = std::min(a.x2, b.x2);
         const float yy2 = std::min(a.y2, b.y2);
-        const float w = std::max(0.f, xx2 - xx1);
-        const float h = std::max(0.f, yy2 - yy1);
+        const float w = std::max(0.f, xx2 - xx1), h = std::max(0.f, yy2 - yy1);
         const float inter = w * h;
         const float areaA = (a.x2 - a.x1) * (a.y2 - a.y1);
         const float areaB = (b.x2 - b.x1) * (b.y2 - b.y1);
-        const float u = areaA + areaB - inter + 1e-6f;
-        return inter / u;
+        return inter / std::max(1e-6f, areaA + areaB - inter);
     }
 
-    // Ultralytics 风格：class-wise NMS（offset 技巧）
-    static std::vector<Det> nms_classwise(std::vector<Det> dets, float iouThr)
+    // 类内 NMS（与 Ultralytics 同思路：给不同类别一个大偏移）
+    static std::vector<Box> nms_classwise(std::vector<Box> dets, float iouThr)
     {
-        const float max_wh = 4096.0f; // 与 Ultralytics 保持一致
-        // 按类别偏移
+        const float max_wh = 4096.f;
         for (auto &d : dets)
         {
             float off = d.cls * max_wh;
             d.x1 += off;
             d.x2 += off;
         }
-        std::sort(dets.begin(), dets.end(), [](const Det &a, const Det &b)
+        std::sort(dets.begin(), dets.end(), [](auto &a, auto &b)
                   { return a.score > b.score; });
-        std::vector<Det> keep;
+        std::vector<Box> keep;
         keep.reserve(dets.size());
         for (size_t i = 0; i < dets.size(); ++i)
         {
             bool drop = false;
             for (const auto &k : keep)
-            {
-                if (iou(dets[i], k) > iouThr)
+                if (IoU(dets[i], k) > iouThr)
                 {
                     drop = true;
                     break;
                 }
-            }
             if (!drop)
                 keep.push_back(dets[i]);
             if (keep.size() >= 300)
                 break;
         }
-        // 去掉偏移
         for (auto &d : keep)
         {
             float off = d.cls * max_wh;
@@ -80,60 +70,45 @@ namespace
         return keep;
     }
 
-    static void drawBox(QImage &img, const Det &d, const QString &text)
+    // 画框：加粗 + 文字底色
+    static void drawBox(QImage &img, const QRectF &r, const QString &text, const QColor &col)
     {
         QPainter p(&img);
         p.setRenderHints(QPainter::Antialiasing | QPainter::SmoothPixmapTransform | QPainter::TextAntialiasing);
-        p.setPen(QPen(Qt::green, 2));
-        QRectF r(d.x1, d.y1, d.x2 - d.x1, d.y2 - d.y1);
+        p.setPen(QPen(col, 3.5));
         p.drawRect(r);
 
         QFont f("Sans", 12, QFont::Bold);
         p.setFont(f);
         QFontMetrics fm(f);
-        const int tw = fm.horizontalAdvance(text) + 8;
-        const int th = fm.height() + 4;
+        int tw = fm.horizontalAdvance(text) + 10, th = fm.height() + 6;
         QRect tr((int)r.x(), std::max(0, (int)r.y() - th), tw, th);
-        p.fillRect(tr, QColor(0, 0, 0, 160));
+        p.fillRect(tr, QColor(0, 0, 0, 170));
         p.setPen(Qt::yellow);
-        p.drawText(tr.adjusted(4, 0, -4, 0), Qt::AlignVCenter | Qt::AlignLeft, text);
+        p.drawText(tr.adjusted(6, 0, -6, 0), Qt::AlignVCenter | Qt::AlignLeft, text);
     }
 
-    // -------- Ultralytics letterbox 预处理 --------
-    // 返回 letterboxed 图像、缩放比例 r、左右上下 padding (dw, dh)
+    // Ultralytics letterbox（pad=114）
     static QImage letterbox(const QImage &src, int newW, int newH, float &r, int &dw, int &dh,
-                            bool scaleup = true, int stride = 32, int padv = 114)
+                            bool scaleup = true, int /*stride*/ = 32, int padv = 114)
     {
-        const int w0 = src.width();
-        const int h0 = src.height();
-        r = std::min((float)newW / (float)w0, (float)newH / (float)h0);
+        const int w0 = src.width(), h0 = src.height();
+        r = std::min((float)newW / w0, (float)newH / h0);
         if (!scaleup)
             r = std::min(r, 1.0f);
-
-        int w = int(std::round(w0 * r));
-        int h = int(std::round(h0 * r));
-
-        // 按 stride 对齐（Ultralytics 的 auto=True 行为在批量中使用；这里保持最常见简单形态）
-        int dw_total = newW - w;
-        int dh_total = newH - h;
+        int w = int(std::round(w0 * r)), h = int(std::round(h0 * r));
+        int dw_total = newW - w, dh_total = newH - h;
         dw = dw_total / 2;
         dh = dh_total / 2;
-
-        // 画布填充 114
         QImage canvas(newW, newH, QImage::Format_RGB888);
         canvas.fill(QColor(padv, padv, padv));
-
-        // 将原图按 r 缩放并粘贴到 (dw, dh)
         QImage scaled = src.scaled(w, h, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
-        {
-            QPainter p(&canvas);
-            p.drawImage(QPoint(dw, dh), scaled);
-        }
+        QPainter p(&canvas);
+        p.drawImage(QPoint(dw, dh), scaled);
         return canvas;
     }
 
-    // 反变换：从 letterbox 坐标 -> 原图坐标
-    static void scale_boxes_back(std::vector<Det> &dets, float r, int dw, int dh, int w0, int h0)
+    static void scale_boxes_back(std::vector<Box> &dets, float r, int dw, int dh, int w0, int h0)
     {
         for (auto &d : dets)
         {
@@ -148,250 +123,100 @@ namespace
         }
     }
 
-#if ORT_DIAG
-    static QString shapeToStr(const std::vector<int64_t> &v)
-    {
-        QString s = "[";
-        for (size_t i = 0; i < v.size(); ++i)
-        {
-            if (i)
-                s += ", ";
-            s += QString::number((long long)v[i]);
-        }
-        s += "]";
-        return s;
-    }
-    static QString onnxTypeToStr(ONNXType t)
-    {
-        switch (t)
-        {
-        case ONNX_TYPE_UNKNOWN:
-            return "UNKNOWN";
-        case ONNX_TYPE_TENSOR:
-            return "TENSOR";
-        case ONNX_TYPE_SEQUENCE:
-            return "SEQUENCE";
-        case ONNX_TYPE_MAP:
-            return "MAP";
-        case ONNX_TYPE_OPAQUE:
-            return "OPAQUE";
-        case ONNX_TYPE_OPTIONAL:
-            return "OPTIONAL";
-        default:
-            return "OTHER";
-        }
-    }
-    static QString elemTypeToStr(ONNXTensorElementDataType t)
-    {
-        switch (t)
-        {
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
-            return "float32";
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:
-            return "uint8";
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:
-            return "int8";
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16:
-            return "uint16";
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16:
-            return "int16";
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
-            return "int32";
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
-            return "int64";
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
-            return "bool";
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
-            return "float16";
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
-            return "double";
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
-            return "bfloat16";
-        default:
-            return "other";
-        }
-    }
-    // 安全把 const char* 转 QString（最多读 4096 字节）
-    static QString safeName(const char *p)
-    {
-        if (!p)
-            return "<null>";
-        const size_t MAX_L = 4096;
-        size_t n = 0;
-        while (n < MAX_L && p[n] != '\0')
-            ++n;
-        return QString::fromUtf8(p, (int)n);
-    }
-#endif // ORT_DIAG
-
 } // namespace
 
-// ====================== ORT 打包结构 ======================
 #ifdef HAVE_ORT
 struct InferenceEngine::OrtPack
 {
-#if ORT_DIAG
-    Ort::Env env{ORT_LOGGING_LEVEL_VERBOSE, "medapp"};
+#if 1
+    Ort::Env env{ORT_LOGGING_LEVEL_INFO, "medapp"};
 #else
     Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "medapp"};
 #endif
     Ort::SessionOptions opts;
     std::unique_ptr<Ort::Session> session;
-
-    std::vector<Ort::AllocatedStringPtr> inNamePtrs, outNamePtrs;
+    std::vector<Ort::AllocatedStringPtr> inPtrs, outPtrs;
     std::vector<const char *> inputNames, outputNames;
 };
-#endif // HAVE_ORT
+#endif
 
-// ====================== InferenceEngine 成员实现 ======================
+// 固定 4 类
+QString InferenceEngine::className(int cls)
+{
+    static const char *n[4] = {"CAM", "PINCER", "MIXED", "NORMAL"};
+    if (cls < 0 || cls > 3)
+        return QString("C%1").arg(cls);
+    return n[cls];
+}
+QColor InferenceEngine::classColor(int cls)
+{
+    switch (cls)
+    {
+    case 0:
+        return QColor(255, 69, 0); // CAM    - OrangeRed
+    case 1:
+        return QColor(30, 144, 255); // PINCER - DodgerBlue
+    case 2:
+        return QColor(50, 205, 50); // MIXED  - LimeGreen
+    case 3:
+        return QColor(255, 215, 0); // NORMAL - Gold
+    default:
+        return QColor(200, 200, 200);
+    }
+}
+
 InferenceEngine::InferenceEngine() = default;
 InferenceEngine::~InferenceEngine() = default;
 
-bool InferenceEngine::loadLabelsFromFile(const QString &path)
-{
-    QFile f(path);
-    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
-        return false;
-    QTextStream ts(&f);
-#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
-    ts.setEncoding(QStringConverter::Utf8);
-#endif
-    std::vector<QString> tmp;
-    while (!ts.atEnd())
-    {
-        QString line = ts.readLine().trimmed();
-        if (line.isEmpty())
-            continue;
-        if (line.startsWith('#'))
-            continue;
-        tmp.push_back(line);
-    }
-    if (!tmp.empty())
-    {
-        m_labels.swap(tmp);
-        return true;
-    }
-    return false;
-}
-
-// ---- 加载模型：含 I/O 摘要与检测头识别（稳健） ----
-bool InferenceEngine::loadModel(const QString &weightsPath, Task /*taskHint*/)
+bool InferenceEngine::loadModel(const QString &path, Task /*taskHint*/)
 {
 #ifndef HAVE_ORT
-    qWarning() << "Built without ONNXRuntime. Skipping model load.";
+    qWarning() << "Built without ONNXRuntime";
     return false;
 #else
     m_ort = std::make_unique<OrtPack>();
     m_ort->opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-
     try
     {
-        m_ort->session = std::make_unique<Ort::Session>(
-            m_ort->env, weightsPath.toUtf8().constData(), m_ort->opts);
+        m_ort->session = std::make_unique<Ort::Session>(m_ort->env, path.toUtf8().constData(), m_ort->opts);
     }
     catch (const Ort::Exception &e)
     {
-        qWarning() << "[ORT] Load failed:" << e.what();
+        qWarning() << "[ORT]" << e.what();
         m_ort.reset();
         return false;
     }
 
     Ort::AllocatorWithDefaultOptions alloc;
-    const size_t numInputs = m_ort->session->GetInputCount();
-    const size_t numOutputs = m_ort->session->GetOutputCount();
-
-    m_ort->inNamePtrs.clear();
-    m_ort->outNamePtrs.clear();
-    m_ort->inputNames.clear();
-    m_ort->outputNames.clear();
-    m_ort->inNamePtrs.reserve(numInputs);
-    m_ort->outNamePtrs.reserve(numOutputs);
-    m_ort->inputNames.reserve(numInputs);
-    m_ort->outputNames.reserve(numOutputs);
-
-    for (size_t i = 0; i < numInputs; ++i)
+    size_t ni = m_ort->session->GetInputCount(), no = m_ort->session->GetOutputCount();
+    m_ort->inPtrs.reserve(ni);
+    m_ort->outPtrs.reserve(no);
+    m_ort->inputNames.reserve(ni);
+    m_ort->outputNames.reserve(no);
+    for (size_t i = 0; i < ni; ++i)
     {
-        m_ort->inNamePtrs.emplace_back(m_ort->session->GetInputNameAllocated(i, alloc));
-        m_ort->inputNames.push_back(m_ort->inNamePtrs.back().get());
+        m_ort->inPtrs.emplace_back(m_ort->session->GetInputNameAllocated(i, alloc));
+        m_ort->inputNames.push_back(m_ort->inPtrs.back().get());
     }
-    for (size_t i = 0; i < numOutputs; ++i)
+    for (size_t i = 0; i < no; ++i)
     {
-        m_ort->outNamePtrs.emplace_back(m_ort->session->GetOutputNameAllocated(i, alloc));
-        m_ort->outputNames.push_back(m_ort->outNamePtrs.back().get());
+        m_ort->outPtrs.emplace_back(m_ort->session->GetOutputNameAllocated(i, alloc));
+        m_ort->outputNames.push_back(m_ort->outPtrs.back().get());
     }
 
-#if ORT_DIAG
+    // 输入尺寸
     try
     {
-        qDebug() << "----- ONNX IO Summary -----";
-        qDebug() << "Inputs:" << (int)numInputs;
-        for (size_t i = 0; i < numInputs; ++i)
+        auto ti = m_ort->session->GetInputTypeInfo(0);
+        if (ti.GetONNXType() == ONNX_TYPE_TENSOR)
         {
-            auto ti = m_ort->session->GetInputTypeInfo(i);
-            ONNXType t = ti.GetONNXType();
-            if (t == ONNX_TYPE_TENSOR)
+            auto inf = ti.GetTensorTypeAndShapeInfo();
+            auto sh = inf.GetShape(); // [1,3,H,W]
+            if (sh.size() >= 4 && sh[2] > 0 && sh[3] > 0)
             {
-                auto tt = ti.GetTensorTypeAndShapeInfo();
-                qDebug() << "  [" << (int)i << "] name=" << safeName(m_ort->inputNames[i])
-                         << " onnx=" << onnxTypeToStr(t)
-                         << " elem=" << elemTypeToStr(tt.GetElementType())
-                         << " shape=" << shapeToStr(tt.GetShape());
+                m_inH = (int)sh[2];
+                m_inW = (int)sh[3];
             }
-            else
-            {
-                qDebug() << "  [" << (int)i << "] name=" << safeName(m_ort->inputNames[i])
-                         << " onnx=" << onnxTypeToStr(t)
-                         << " (non-tensor)";
-            }
-        }
-        qDebug() << "Outputs:" << (int)numOutputs;
-        for (size_t i = 0; i < numOutputs; ++i)
-        {
-            auto to = m_ort->session->GetOutputTypeInfo(i);
-            ONNXType t = to.GetONNXType();
-            if (t == ONNX_TYPE_TENSOR)
-            {
-                auto tt = to.GetTensorTypeAndShapeInfo();
-                qDebug() << "  [" << (int)i << "] name=" << safeName(m_ort->outputNames[i])
-                         << " onnx=" << onnxTypeToStr(t)
-                         << " elem=" << elemTypeToStr(tt.GetElementType())
-                         << " shape=" << shapeToStr(tt.GetShape());
-            }
-            else
-            {
-                qDebug() << "  [" << (int)i << "] name=" << safeName(m_ort->outputNames[i])
-                         << " onnx=" << onnxTypeToStr(t)
-                         << " (non-tensor)";
-            }
-        }
-    }
-    catch (const std::exception &e)
-    {
-        qWarning() << "[ORT] IO summary error:" << e.what();
-    }
-#endif // ORT_DIAG
-
-    // 输入尺寸：仅当 input0 是 Tensor 时读取，否则回退 640
-    try
-    {
-        auto t0 = m_ort->session->GetInputTypeInfo(0);
-        if (t0.GetONNXType() == ONNX_TYPE_TENSOR)
-        {
-            auto inInfo = t0.GetTensorTypeAndShapeInfo();
-            auto inShape = inInfo.GetShape(); // [1,3,H,W] 或 [N,3,H,W]
-            if (inShape.size() >= 4)
-            {
-                long long H = inShape[2], W = inShape[3];
-                if (H > 0 && W > 0)
-                {
-                    m_inH = (int)H;
-                    m_inW = (int)W;
-                }
-            }
-        }
-        else
-        {
-            m_inH = m_inW = 640;
         }
     }
     catch (...)
@@ -399,151 +224,110 @@ bool InferenceEngine::loadModel(const QString &weightsPath, Task /*taskHint*/)
         m_inH = m_inW = 640;
     }
 
-    // 检测头识别：在 “tensor & float & rank=3” 的输出里找 [1,C,N] 或 [1,N,C]
+    // 输出结构判定：挑一个 rank=3 的 float 输出
     m_isYoloDetect = false;
     m_hasObj = false;
     m_numClasses = 0;
     m_channels = 0;
-    try
+    for (size_t i = 0; i < no; ++i)
     {
-        for (size_t oi = 0; oi < numOutputs; ++oi)
+        auto to = m_ort->session->GetOutputTypeInfo(i);
+        if (to.GetONNXType() != ONNX_TYPE_TENSOR)
+            continue;
+        auto inf = to.GetTensorTypeAndShapeInfo();
+        if (inf.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+            continue;
+        auto sh = inf.GetShape(); // [1,C,N] 或 [1,N,C]
+        if (sh.size() == 3)
         {
-            auto to = m_ort->session->GetOutputTypeInfo(oi);
-            if (to.GetONNXType() != ONNX_TYPE_TENSOR)
-                continue;
-            auto outInfo = to.GetTensorTypeAndShapeInfo();
-            if (outInfo.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
-                continue;
-            auto outShape = outInfo.GetShape();
-            if (outShape.size() == 3)
+            int d1 = std::abs((int)sh[1]), d2 = std::abs((int)sh[2]);
+            int C = std::min(d1, d2), N = std::max(d1, d2);
+            if (C >= 6 && N >= 10)
             {
-                int d1 = (int)std::llabs(outShape[1]);
-                int d2 = (int)std::llabs(outShape[2]);
-                int C = std::min(d1, d2);
-                int N = std::max(d1, d2);
-                if (C >= 6 && N >= 10)
+                m_isYoloDetect = true;
+                int nc_v8 = C - 4, nc_v5 = C - 5;
+                if (nc_v8 >= 1)
                 {
-                    m_isYoloDetect = true;
-                    int nc_v8 = C - 4, nc_v5 = C - 5;
-                    if (nc_v8 >= 1)
-                    {
-                        m_hasObj = false;
-                        m_numClasses = nc_v8;
-                    }
-                    else
-                    {
-                        m_hasObj = true;
-                        m_numClasses = std::max(1, nc_v5);
-                    }
-                    m_channels = C;
-                    break;
+                    m_hasObj = false;
+                    m_numClasses = nc_v8;
                 }
+                else
+                {
+                    m_hasObj = true;
+                    m_numClasses = std::max(1, nc_v5);
+                }
+                m_channels = C;
+                break;
             }
         }
     }
-    catch (...)
-    {
-        // 继续，run() 里还有兜底
-    }
-
-#if ORT_DIAG
-    qDebug() << "[ORT] in=" << m_inW << "x" << m_inH
-             << "detect=" << m_isYoloDetect
-             << "C=" << m_channels
-             << "nc=" << m_numClasses
-             << "hasObj=" << m_hasObj;
-#endif
-
-    // 若没显式设置标签，给默认名
-    if (m_labels.empty() && m_numClasses > 0)
-    {
-        m_labels.resize(m_numClasses);
-        for (int i = 0; i < m_numClasses; ++i)
-            m_labels[i] = QString("Class %1").arg(i);
-    }
-
-    m_modelPath = weightsPath;
+    m_modelPath = path;
     return true;
-#endif // HAVE_ORT
+#endif
 }
 
-// ---- 推理：Ultralytics 等价流程（letterbox -> ORT -> 解析 -> class-wise NMS -> 反变换 -> 绘制） ----
 InferenceEngine::Result InferenceEngine::run(const QImage &input, Task /*taskHint*/) const
 {
-    Result r;
+    Result R;
     QImage vis = input.convertToFormat(QImage::Format_ARGB32);
-
 #ifndef HAVE_ORT
-    r.outputImage = vis;
-    r.summary = "Built without ONNXRuntime";
-    return r;
+    R.outputImage = vis;
+    R.summary = "Built without ONNXRuntime";
+    return R;
 #else
     if (!m_ort || !m_ort->session)
     {
-        r.outputImage = vis;
-        r.summary = "Model not loaded";
-        return r;
+        R.outputImage = vis;
+        R.summary = "Model not loaded";
+        return R;
     }
 
-    // ---------- 预处理（Ultralytics letterbox） ----------
+    // 预处理（Ultralytics letterbox + CHW + [0,1]）
     const int netW = m_inW, netH = m_inH;
     QImage rgb = input.convertToFormat(QImage::Format_RGB888);
-    float rsc = 1.f;
+    float rs = 1.f;
     int dw = 0, dh = 0;
-    QImage lbox = letterbox(rgb, netW, netH, rsc, dw, dh, /*scaleup=*/true, /*stride=*/32, /*padv=*/114);
+    QImage lbox = letterbox(rgb, netW, netH, rs, dw, dh, true, 32, 114);
 
-    // to NCHW float32 [0,1]
     std::vector<float> tensor(3 * netH * netW);
     for (int y = 0; y < netH; ++y)
     {
         const uchar *line = lbox.constScanLine(y);
         for (int x = 0; x < netW; ++x)
         {
-            const int idx = y * netW + x;
-            tensor[0 * netH * netW + idx] = line[3 * x + 0] / 255.0f; // R
-            tensor[1 * netH * netW + idx] = line[3 * x + 1] / 255.0f; // G
-            tensor[2 * netH * netW + idx] = line[3 * x + 2] / 255.0f; // B
+            int idx = y * netW + x;
+            tensor[0 * netH * netW + idx] = line[3 * x + 0] / 255.f;
+            tensor[1 * netH * netW + idx] = line[3 * x + 1] / 255.f;
+            tensor[2 * netH * netW + idx] = line[3 * x + 2] / 255.f;
         }
     }
-
     Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator, OrtMemTypeDefault);
     std::array<int64_t, 4> ishape{1, 3, netH, netW};
     Ort::Value in = Ort::Value::CreateTensor<float>(mem, tensor.data(), tensor.size(), ishape.data(), ishape.size());
 
-    // ---------- 选择一个 rank=3 float 的输出 ----------
-    const size_t numOut = m_ort->session->GetOutputCount();
+    // 选择一个 rank=3 的 float 输出
+    const size_t no = m_ort->session->GetOutputCount();
     int chosen = -1;
-    std::vector<std::vector<int64_t>> outShapes(numOut);
-    std::vector<ONNXTensorElementDataType> outTypes(numOut);
-    for (size_t i = 0; i < numOut; ++i)
+    std::vector<std::vector<int64_t>> osh(no);
+    for (size_t i = 0; i < no; ++i)
     {
-        auto ti = m_ort->session->GetOutputTypeInfo(i);
-        if (ti.GetONNXType() != ONNX_TYPE_TENSOR)
+        auto t = m_ort->session->GetOutputTypeInfo(i);
+        if (t.GetONNXType() != ONNX_TYPE_TENSOR)
             continue;
-        auto tshape = ti.GetTensorTypeAndShapeInfo();
-        outShapes[i] = tshape.GetShape();
-        outTypes[i] = tshape.GetElementType();
-        if (chosen < 0 &&
-            outTypes[i] == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
-            outShapes[i].size() == 3)
-        {
+        auto info = t.GetTensorTypeAndShapeInfo();
+        if (info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+            continue;
+        osh[i] = info.GetShape();
+        if (chosen < 0 && osh[i].size() == 3)
             chosen = (int)i;
-        }
     }
     if (chosen < 0)
     {
-        r.outputImage = vis;
-        r.summary = "No suitable tensor output found (expect rank=3 float).";
-        return r;
+        R.outputImage = vis;
+        R.summary = "No rank-3 float output";
+        return R;
     }
 
-#if ORT_DIAG
-    qDebug() << "[ORT] chosen output index =" << chosen
-             << " shape=" << shapeToStr(outShapes[(size_t)chosen])
-             << " type=" << elemTypeToStr(outTypes[(size_t)chosen]);
-#endif
-
-    // ---------- 推理 ----------
     const char *outName = m_ort->outputNames[(size_t)chosen];
     std::vector<Ort::Value> outs;
     try
@@ -554,102 +338,74 @@ InferenceEngine::Result InferenceEngine::run(const QImage &input, Task /*taskHin
     }
     catch (const Ort::Exception &e)
     {
-        r.outputImage = vis;
-        r.summary = QString::fromUtf8(e.what());
-        return r;
+        R.outputImage = vis;
+        R.summary = QString::fromUtf8(e.what());
+        return R;
     }
     if (outs.empty() || !outs[0].IsTensor())
     {
-        r.outputImage = vis;
-        r.summary = "Invalid output (empty or non-tensor)";
-        return r;
+        R.outputImage = vis;
+        R.summary = "Invalid output";
+        return R;
     }
 
     const float *data = outs[0].GetTensorData<float>();
     auto info = outs[0].GetTensorTypeAndShapeInfo();
-    auto shape = info.GetShape(); // 期望 [1, N, A]，或 [1, A, N]
-    if (shape.size() != 3)
-    {
-        r.outputImage = vis;
-        r.summary = QString("Unexpected output rank: %1").arg((int)shape.size());
-        return r;
-    }
 
-    // ---------- 解析 YOLO（与 Ultralytics 一致） ----------
-    const int s1 = (int)std::llabs(shape[1]);
-    const int s2 = (int)std::llabs(shape[2]);
-    const bool attrLast = (s2 >= 6 && s2 <= 1024); // 更常见： [1, N, A]
-    const int A = attrLast ? s2 : s1;              // 属性维：4(+1)+nc
-    const int N = attrLast ? s1 : s2;              // 候选数
+    auto sh = info.GetShape(); // [1,N,A] 或 [1,A,N]
+    const int d1 = std::abs((int)sh[1]);
+    const int d2 = std::abs((int)sh[2]);
 
-    // 判定是否含 obj 与 nc（若 load 时未识别）
-    int C = A;
-    int nc = (m_numClasses > 0) ? m_numClasses : std::max(1, std::max(C - 4, C - 5));
-    bool hasObj = (m_numClasses > 0) ? m_hasObj : (C - 5 == nc); // v5: 4+1+nc
+    // 属性维（A）应该是两者中较小的那个（通常 >=6 且远小于候选框数）
+    const int A = std::min(d1, d2);
+    const int N = std::max(d1, d2);
 
-    // 采样判断分数是否已经 sigmoid（若已在 0..1 区间，不再二次 sigmoid）
-    auto need_sigmoid = [&](int offset, int len) -> bool
-    {
-        int cnt = 0, over = 0, under = 0;
-        for (int i = 0; i < std::min(len, 2000); ++i)
-        {
-            float v = data[offset + i];
-            if (v > 1.0f)
-                over++;
-            else if (v < 0.0f)
-                under++;
-            cnt++;
-        }
-        // 有明显超界才做 sigmoid
-        return (over + under) * 1.0f / std::max(1, cnt) > 0.05; // 5% 超界判定为 logits
-    };
+    // 如果第二维等于属性维，则说明布局是 [1, N, A]（属性在最后一维）；否则为 [1, A, N]
+    const bool attrLast = (d2 == A);
 
-    // 解析函数
+    int nc = (m_numClasses > 0 ? m_numClasses : std::max(1, std::max(A - 4, A - 5)));
+    bool hasObj = (m_numClasses > 0 ? m_hasObj : (A - 5 == nc));
+
+    // 统一的取值函数：i 为第 i 个候选框，k 为属性下标（0..A-1）
     auto getAttr = [&](int i, int k) -> float
     {
-        // i in [0,N), k in [0,A)
         return attrLast ? data[i * A + k] : data[k * N + i];
     };
 
-    // 是否需要对 cls 概率/obj 再做 sigmoid
-    bool cls_need_sig = false, obj_need_sig = false;
+    auto need_sigmoid = [&](int offset, int len) -> bool
     {
-        // 抽查第 0~min(N,32) 个候选的前 32 个类别 logits
-        const int sample_n = std::min(N, 32);
-        const int cls_off = hasObj ? 5 : 4;
-        if (nc > 0)
+        // 粗略判断是否需要 sigmoid（已是 0..1 就不再做）
+        int cnt = 0, out = 0;
+        for (int i = 0; i < std::min(len, 512); ++i)
         {
-            // 取第一行进行判定即可
-            const int off0 = attrLast ? (0 * A + cls_off) : (cls_off * N + 0);
-            cls_need_sig = need_sigmoid(off0, std::min(nc, 64));
+            float v = data[offset + i];
+            if (v < 0.f || v > 1.f)
+                out++;
+            cnt++;
         }
-        if (hasObj)
-        {
-            const int off_obj = attrLast ? (0 * A + 4) : (4 * N + 0);
-            obj_need_sig = need_sigmoid(off_obj, sample_n);
-        }
+        return out > cnt * 0.05;
+    };
+    bool cls_need_sig = false, obj_need_sig = false;
+    if (nc > 0)
+    {
+        int cls_off = hasObj ? 5 : 4;
+        int off0 = attrLast ? (0 * A + cls_off) : (cls_off * N + 0);
+        cls_need_sig = need_sigmoid(off0, std::min(nc, 64));
+    }
+    if (hasObj)
+    {
+        int off = attrLast ? (0 * A + 4) : (4 * N + 0);
+        obj_need_sig = need_sigmoid(off, std::min(N, 64));
     }
 
-    // 候选收集
-    std::vector<Det> dets;
+    std::vector<Box> dets;
     dets.reserve(std::min(N, 3000));
     for (int i = 0; i < N; ++i)
     {
-        float cx = getAttr(i, 0);
-        float cy = getAttr(i, 1);
-        float bw = getAttr(i, 2);
-        float bh = getAttr(i, 3);
+        float cx = getAttr(i, 0), cy = getAttr(i, 1), bw = getAttr(i, 2), bh = getAttr(i, 3);
 
-        // Ultralytics 导出通常已是像素坐标（基于 letterbox 后的输入尺寸）
-        // 若发现坐标全部在 [0,2] 内，说明是归一化，放大到像素
-        static bool checked_norm = false;
-        static bool normalized = false;
-        if (!checked_norm)
-        {
-            float mx = std::max({std::fabs(cx), std::fabs(cy), std::fabs(bw), std::fabs(bh)});
-            normalized = (mx <= 2.0f); // 经验阈值
-            checked_norm = true;
-        }
+        float mx = std::max({std::fabs(cx), std::fabs(cy), std::fabs(bw), std::fabs(bh)});
+        bool normalized = (mx <= 1.5f); // 认为是 0..1 坐标
         if (normalized)
         {
             cx *= netW;
@@ -662,59 +418,68 @@ InferenceEngine::Result InferenceEngine::run(const QImage &input, Task /*taskHin
         if (hasObj && obj_need_sig)
             obj = sigmoid(obj);
 
-        // 取最大类别置信度
         int best = -1;
         float bestp = 0.f;
-        const int cls_off = hasObj ? 5 : 4;
+        int cls_off = hasObj ? 5 : 4;
         for (int k = 0; k < nc; ++k)
         {
             float p = getAttr(i, cls_off + k);
             if (cls_need_sig)
                 p = sigmoid(p);
-            float score = hasObj ? (obj * p) : p;
-            if (score > bestp)
+            float s = hasObj ? (obj * p) : p;
+            if (s > bestp)
             {
-                bestp = score;
+                bestp = s;
                 best = k;
             }
         }
         if (best < 0 || bestp < m_confThr)
             continue;
 
-        // (cx,cy,w,h)->(x1,y1,x2,y2)（仍在 letterbox 坐标系）
-        float x1 = cx - bw * 0.5f;
-        float y1 = cy - bh * 0.5f;
-        float x2 = cx + bw * 0.5f;
-        float y2 = cy + bh * 0.5f;
-
-        // clip 到网络尺寸（防止溢出）
+        float x1 = cx - bw * 0.5f, y1 = cy - bh * 0.5f, x2 = cx + bw * 0.5f, y2 = cy + bh * 0.5f;
         x1 = std::clamp(x1, 0.f, (float)netW - 1.f);
         y1 = std::clamp(y1, 0.f, (float)netH - 1.f);
         x2 = std::clamp(x2, 0.f, (float)netW - 1.f);
         y2 = std::clamp(y2, 0.f, (float)netH - 1.f);
 
-        if (x2 - x1 >= 2 && y2 - y1 >= 2)
-            dets.push_back({x1, y1, x2, y2, bestp, best});
+        // 压到 4 类范围（若模型有更多类别）
+        int mapped = std::clamp(best, 0, 3);
+        dets.push_back({x1, y1, x2, y2, bestp, mapped});
     }
 
-    // ---------- NMS（class-wise，与 Ultralytics 一致） ----------
     auto kept = nms_classwise(std::move(dets), m_iouThr);
+    scale_boxes_back(kept, rs, dw, dh, input.width(), input.height());
 
-    // ---------- 坐标反变换回原图尺寸 ----------
-    scale_boxes_back(kept, rsc, dw, dh, input.width(), input.height());
-
-    // ---------- 绘制 ----------
     for (const auto &d : kept)
     {
-        QString name = (d.cls >= 0 && d.cls < (int)m_labels.size())
-                           ? m_labels[d.cls]
-                           : QString("cls%1").arg(d.cls);
-        QString txt = QString("%1  %2%").arg(name).arg(int(std::round(d.score * 100.f)));
-        drawBox(vis, d, txt);
+        QRectF r(d.x1, d.y1, d.x2 - d.x1, d.y2 - d.y1);
+        QString txt = QString("%1  %2%").arg(InferenceEngine::className(d.cls)).arg(int(std::round(d.score * 100)));
+        drawBox(vis, r, txt, InferenceEngine::classColor(d.cls));
     }
 
-    r.outputImage = vis;
-    r.summary = QString("Detections: %1").arg(kept.size());
-    return r;
-#endif // HAVE_ORT
+    R.outputImage = vis;
+    R.dets.reserve(kept.size());
+    for (auto &b : kept)
+        R.dets.push_back({b.x1, b.y1, b.x2, b.y2, b.score, b.cls});
+
+    int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    for (auto &b : kept)
+    {
+        if (b.cls == 0)
+            ++c0;
+        else if (b.cls == 1)
+            ++c1;
+        else if (b.cls == 2)
+            ++c2;
+        else
+            ++c3;
+    }
+    R.summary = QString("Detections: %1  [CAM:%2  PINCER:%3  MIXED:%4  NORMAL:%5]")
+                    .arg((int)kept.size())
+                    .arg(c0)
+                    .arg(c1)
+                    .arg(c2)
+                    .arg(c3);
+    return R;
+#endif
 }

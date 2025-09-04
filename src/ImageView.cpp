@@ -8,21 +8,50 @@ ImageView::ImageView(QWidget *parent) : QGraphicsView(parent), m_scene(new QGrap
     setScene(m_scene);
     setDragMode(QGraphicsView::NoDrag);
     setRenderHints(QPainter::Antialiasing | QPainter::SmoothPixmapTransform | QPainter::TextAntialiasing);
-    setBackgroundBrush(Qt::black);
+    setBackgroundBrush(QColor(244, 246, 250));
 }
-void ImageView::setImage(const QImage &img)
+
+// void ImageView::setImage(const QImage &img)
+// {
+//     const bool had = (m_pix != nullptr);
+//     const QTransform keep = transform();
+
+//     if (!m_pix)
+//     {
+//         m_pix = m_scene->addPixmap(QPixmap::fromImage(img));
+//     }
+//     else
+//     {
+//         m_pix->setPixmap(QPixmap::fromImage(img));
+//     }
+//     m_scene->setSceneRect(m_pix->boundingRect());
+
+//     if (had)
+//     {
+//         // 保持用户当前缩放/平移
+//         setTransform(keep);
+//     }
+//     else
+//     {
+//         // 首次显示：1:1，不再 fitInView，避免被缩得很小
+//         setTransform(QTransform());
+//         setAlignment(Qt::AlignCenter);
+//         centerOn(m_pix);
+//     }
+// }
+
+void ImageView::setImage(const QImage &img, bool fitToWindow)
 {
     if (!m_pix)
-    {
         m_pix = m_scene->addPixmap(QPixmap::fromImage(img));
-    }
     else
-    {
         m_pix->setPixmap(QPixmap::fromImage(img));
-    }
     m_scene->setSceneRect(m_pix->boundingRect());
-    resetZoom();
+    if (fitToWindow || !transform().isScaling())
+        resetZoom(); // 首次或要求 fit：自适应视口
+                     // 否则保持用户当前缩放/平移
 }
+
 void ImageView::clearImage()
 {
     if (m_pix)
