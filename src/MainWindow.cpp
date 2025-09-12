@@ -338,12 +338,18 @@ void MainWindow::runBatchInference()
 
 void MainWindow::loadFAIModel()
 {
-    QString f = QFileDialog::getOpenFileName(this, "Select FAI ONNX", QString(),
-                                             "ONNX model (*.onnx);;All files (*.*)");
-    if (f.isEmpty())
-        return;
-    m_faiOnnxPath = f;
+    // 使用相对路径加载模型，避免嵌入大文件到资源中
+    QString modelPath = QCoreApplication::applicationDirPath() + "/models/fai_xray.onnx";
 
+    // 检查文件是否存在
+    if (!QFileInfo::exists(modelPath))
+    {
+        QMessageBox::warning(this, "Load Model",
+                             QString("Model file not found at: %1").arg(modelPath));
+        return;
+    }
+
+    m_faiOnnxPath = modelPath;
     m_modelReady = m_engine.loadModel(m_faiOnnxPath, InferenceEngine::Task::FAI_XRay);
     if (!m_modelReady)
     {
@@ -354,7 +360,7 @@ void MainWindow::loadFAIModel()
         if (a)
             a->setEnabled(true);
 
-    log(QString("FAI ONNX loaded: %1").arg(f));
+    log(QString("FAI ONNX loaded: %1").arg(modelPath));
 }
 
 void MainWindow::clearAll()

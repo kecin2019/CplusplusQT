@@ -178,7 +178,7 @@ bool InferenceEngine::loadModel(const QString &path, Task /*taskHint*/)
     m_ort->opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
     try
     {
-        m_ort->session = std::make_unique<Ort::Session>(m_ort->env, path.toUtf8().constData(), m_ort->opts);
+        m_ort->session = std::make_unique<Ort::Session>(m_ort->env, path.toStdWString().c_str(), m_ort->opts);
     }
     catch (const Ort::Exception &e)
     {

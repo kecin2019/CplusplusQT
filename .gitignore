@@ -3,3 +3,6 @@ build
 src_backup
 test
 weights
+.vs
+vcpkg_installed
+*.onnx
