@@ -6,24 +6,11 @@ cmake_minimum_required(VERSION 3.18)
 project(MedYOLO11Qt LANGUAGES CXX)
 
 # 设置Windows平台UTF-8编码支持
-if(WIN32)
-    add_compile_options(/utf-8)
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /MANIFEST:NO")
-    add_compile_definitions(UNICODE _UNICODE)
-endif()
-
-# 设置跨平台编译选项
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
-    # GCC编译选项
-    add_compile_options(-Wall -Wextra -pedantic -Werror=return-type)
-    # 对于较新版本的GCC，可以启用-Wsuggest-override
-    if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "5.0")
-        add_compile_options(-Wsuggest-override)
-    endif()
-elseif(MSVC)
-    # MSVC编译选项
-    add_compile_options(/W4 /wd4251 /wd4275)
-endif()
+# if(WIN32)
+#     add_compile_options(/utf-8)
+#     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /MANIFEST:NO")
+#     add_compile_definitions(UNICODE _UNICODE)
+# endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -37,88 +24,63 @@ set(CMAKE_AUTORCC ON)
 option(USE_GDCM "Enable DICOM reading via GDCM (libgdcm)" ON)
 option(USE_ORT  "Enable ONNXRuntime for FAI classification" ON)
 
-# ---------------- 跨平台查找Qt ----------------
-if(WIN32)
-    # Windows下可以手动指定Qt路径（可选）
-    # set(QT_INSTALL_PATH "E:/tools/Qt/6.9.2/msvc2022_64")  # 替换为实际编译器目录
-    # set(CMAKE_PREFIX_PATH ${QT_INSTALL_PATH})  # 告诉CMake从这里找Qt
-endif()
-
+# ---------------- 手动指定 Qt 路径 ----------------
+# 注意：Qt路径需精确到编译器目录（根据你的VS版本选择，如msvc2022_64）
+set(QT_INSTALL_PATH "E:/tools/Qt/6.9.2/msvc2022_64")  # 替换为实际编译器目录
+set(CMAKE_PREFIX_PATH ${QT_INSTALL_PATH})  # 告诉CMake从这里找Qt
 find_package(Qt6 REQUIRED COMPONENTS Widgets)
 
 # ---------------- GDCM（DICOM库） ----------------
 if(USE_GDCM)
-  if(WIN32)
-    # Windows下手动指定GDCM路径
-    set(GDCM_INSTALL_PATH "E:/tools/GDCM-3.2.0-Windows-x86_64")
-    set(GDCM_INCLUDE_DIRS ${GDCM_INSTALL_PATH}/include/gdcm-3.2)
-    set(GDCM_LIBRARY_DIR ${GDCM_INSTALL_PATH}/lib)
-    
-    # 查找 GDCM 库
-    find_library(GDCM_MSFF_LIB
-      NAMES gdcmMSFF
-      PATHS ${GDCM_LIBRARY_DIR} 
-      NO_DEFAULT_PATH  # 只在指定路径查找
-    )
-    find_library(GDCM_COMMON_LIB
-      NAMES gdcmCommon
-      PATHS ${GDCM_LIBRARY_DIR}
-      NO_DEFAULT_PATH
-    )
-    find_library(GDCM_DSED_LIB
-      NAMES gdcmDSED
-      PATHS ${GDCM_LIBRARY_DIR}
-      NO_DEFAULT_PATH
-    )
-  else()
-    # Linux下使用系统包管理器安装的GDCM
-    find_package(GDCM REQUIRED)
-    set(GDCM_INCLUDE_DIRS_FALLBACK ${GDCM_INCLUDE_DIRS})
-    list(APPEND GDCM_LIBS ${GDCM_LIBRARIES})
-  endif()
+  # 手动指定 GDCM 路径
+set(GDCM_INSTALL_PATH "E:/tools/GDCM-3.2.0-Windows-x86_64")
+set(GDCM_INCLUDE_DIRS ${GDCM_INSTALL_PATH}/include/gdcm-3.2)
+set(GDCM_LIBRARY_DIR ${GDCM_INSTALL_PATH}/lib)
+  
+  # 查找 GDCM 库
+  find_library(GDCM_MSFF_LIB
+    NAMES gdcmMSFF
+    PATHS ${GDCM_LIBRARY_DIR} 
+    NO_DEFAULT_PATH  # 只在指定路径查找
+  )
+  find_library(GDCM_COMMON_LIB
+    NAMES gdcmCommon
+    PATHS ${GDCM_LIBRARY_DIR}
+    NO_DEFAULT_PATH
+  )
+  find_library(GDCM_DSED_LIB
+    NAMES gdcmDSED
+    PATHS ${GDCM_LIBRARY_DIR}
+    NO_DEFAULT_PATH
+  )
 
-  if((WIN32 AND GDCM_MSFF_LIB AND GDCM_COMMON_LIB AND GDCM_DSED_LIB AND EXISTS ${GDCM_INCLUDE_DIRS}) OR 
-     (UNIX AND GDCM_FOUND))
-    if(WIN32)
-      message(STATUS "GDCM found at: ${GDCM_INSTALL_PATH}")
-      list(APPEND GDCM_LIBS ${GDCM_MSFF_LIB} ${GDCM_COMMON_LIB} ${GDCM_DSED_LIB})
-      set(GDCM_INCLUDE_DIRS_FALLBACK ${GDCM_INCLUDE_DIRS})
-    endif()
+  if(GDCM_MSFF_LIB AND GDCM_COMMON_LIB AND GDCM_DSED_LIB AND EXISTS ${GDCM_INCLUDE_DIRS})
+    message(STATUS "GDCM found at: ${GDCM_INSTALL_PATH}")
+    list(APPEND GDCM_LIBS ${GDCM_MSFF_LIB} ${GDCM_COMMON_LIB} ${GDCM_DSED_LIB})
+    set(GDCM_INCLUDE_DIRS_FALLBACK ${GDCM_INCLUDE_DIRS})
     add_compile_definitions(HAVE_GDCM)  # 启用DICOM功能
   else()
-    message(FATAL_ERROR "GDCM not found. Please install GDCM or disable with -DUSE_GDCM=OFF.")
+    message(FATAL_ERROR "GDCM not found in ${GDCM_INSTALL_PATH}. Check path.")
     set(USE_GDCM OFF)
   endif()
 endif()
 
 # ---------------- ONNXRuntime ----------------
+# 手动指定 ONNXRuntime 路径
+set(ONNXRUNTIME_INSTALL_PATH "E:/tools/onnxruntime-win-x64-1.22.1")
+set(ONNXRUNTIME_INCLUDE_DIR ${ONNXRUNTIME_INSTALL_PATH}/include)
+set(ONNXRUNTIME_LIBRARY_DIR ${ONNXRUNTIME_INSTALL_PATH}/lib)
+
 if(USE_ORT)
-  if(WIN32)
-    # Windows下手动指定ONNXRuntime路径
-    set(ONNXRUNTIME_INSTALL_PATH "E:/tools/onnxruntime-win-x64-1.22.1")
-    set(ONNXRUNTIME_INCLUDE_DIR ${ONNXRUNTIME_INSTALL_PATH}/include)
-    set(ONNXRUNTIME_LIBRARY_DIR ${ONNXRUNTIME_INSTALL_PATH}/lib)
-    
-    # 查找 ONNXRuntime 库
-    find_library(ONNXRUNTIME_LIB
-      NAMES onnxruntime
-      PATHS ${ONNXRUNTIME_LIBRARY_DIR}
-      NO_DEFAULT_PATH  # 只在指定路径查找
-    )
-  else()
-    # Linux下使用系统包管理器安装的ONNXRuntime或从源码构建
-    find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
-              PATHS /usr/include/onnxruntime /usr/local/include/onnxruntime)
-    find_library(ONNXRUNTIME_LIB onnxruntime
-                PATHS /usr/lib /usr/local/lib)
-  endif()
+  # 查找 ONNXRuntime 库
+  find_library(ONNXRUNTIME_LIB
+    NAMES onnxruntime
+    PATHS ${ONNXRUNTIME_LIBRARY_DIR}
+    NO_DEFAULT_PATH  # 只在指定路径查找
+  )
   
   if(ONNXRUNTIME_LIB AND EXISTS ${ONNXRUNTIME_INCLUDE_DIR})
-    if(WIN32)
-      message(STATUS "ONNXRuntime found at: ${ONNXRUNTIME_INSTALL_PATH}")
-    else()
-      message(STATUS "ONNXRuntime found")
-    endif()
+    message(STATUS "ONNXRuntime found at: ${ONNXRUNTIME_INSTALL_PATH}")
     add_compile_definitions(HAVE_ORT)
   else()
     message(WARNING "ONNXRuntime not found. Disable with -DUSE_ORT=OFF.")
@@ -145,7 +107,7 @@ target_link_libraries(medapp PRIVATE
   ${ONNXRUNTIME_LIB} # 链接ONNX库
 )
 
-# 跨平台设置
+# Windows 部分
 if(WIN32)
   # 设置 Windows 子系统（GUI）
   set_target_properties(medapp PROPERTIES
@@ -194,6 +156,21 @@ if(WIN32)
       $<TARGET_FILE_DIR:medapp>/platforms/
     )
   endif()
+  # 复制模型文件
+  add_custom_command(TARGET medapp POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+    $<TARGET_FILE_DIR:medapp>/models/
+  )
+  add_custom_command(TARGET medapp POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${CMAKE_SOURCE_DIR}/models/fai_xray.onnx
+    $<TARGET_FILE_DIR:medapp>/models/
+  )
+  add_custom_command(TARGET medapp POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${CMAKE_SOURCE_DIR}/models/mri_segmentation.onnx
+    $<TARGET_FILE_DIR:medapp>/models/
+  )
   
   # GDCM DLLs
   file(GLOB GDCM_DLLS "${GDCM_INSTALL_PATH}/bin/gdcm*.dll")
@@ -202,45 +179,15 @@ if(WIN32)
     ${GDCM_DLLS}
     $<TARGET_FILE_DIR:medapp>
   )
-else()
-  # Linux平台设置
-  # 确保可执行文件有执行权限
-  set_target_properties(medapp PROPERTIES
-    BUILD_WITH_INSTALL_RPATH TRUE
-    INSTALL_RPATH "$ORIGIN/lib"
-  )
-  
-  # 在Linux下，通常不需要复制Qt和其他库，因为它们通过包管理器安装到系统中
 endif()
 
-# 跨平台复制模型文件
-add_custom_command(TARGET medapp POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E make_directory
-  $<TARGET_FILE_DIR:medapp>/models/
-)
-add_custom_command(TARGET medapp POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different
-  ${CMAKE_SOURCE_DIR}/models/fai_xray.onnx
-  $<TARGET_FILE_DIR:medapp>/models/
-)
-add_custom_command(TARGET medapp POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different
-  ${CMAKE_SOURCE_DIR}/models/mri_segmentation.onnx
-  $<TARGET_FILE_DIR:medapp>/models/
-)
-
-# 安装规则 (跨平台)
+# 安装规则 (可选)
 install(TARGETS medapp
   RUNTIME DESTINATION bin
 )
 
-# 跨平台安装模型文件
-execute_process(COMMAND mkdir -p "${CMAKE_BINARY_DIR}/temp_install/models")
-install(DIRECTORY models/ DESTINATION bin/models)
-
-# 平台特定的安装规则
+# 安装依赖 DLL (Windows)
 if(WIN32)
-  # 安装依赖 DLL (Windows)
   # Qt
   if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     file(GLOB QT_DEBUG_DLLS "${QT_DLL_DIR}/Qt6Widgetsd.dll" "${QT_DLL_DIR}/Qt6Cored.dll" "${QT_DLL_DIR}/Qt6Guid.dll")
@@ -279,27 +226,6 @@ if(WIN32)
   
   # install(FILES "${CMAKE_SOURCE_DIR}/models/fai_xray.onnx"
   #         DESTINATION bin/models)
-else()
-  # Linux平台安装规则
-  # 在Linux上，通常通过包管理器安装依赖，不需要复制库文件
-  # 创建运行脚本帮助用户启动应用
-  install(CODE "\n    file(WRITE \"$ENV{DESTDIR}\\${CMAKE_INSTALL_PREFIX}/bin/run_medapp.sh\" \"
-      #!/bin/sh\\n\
-      cd \"$(dirname \\"$0\\")\"\\n\
-      ./medapp\\n\"
-    )\n    execute_process(COMMAND chmod +x \"$ENV{DESTDIR}\\${CMAKE_INSTALL_PREFIX}/bin/run_medapp.sh\")\n  ")
-  
-  # 添加桌面图标支持
-  install(CODE "\n    file(WRITE \"$ENV{DESTDIR}\\${CMAKE_INSTALL_PREFIX}/share/applications/medyolo11qt.desktop\" \"
-      [Desktop Entry]\\n\
-      Type=Application\\n\
-      Name=MedYOLO11Qt\\n\
-      Comment=Medical Image Analysis Software with AI Classification\\n\
-      Exec=\"$CMAKE_INSTALL_PREFIX/bin/run_medapp.sh\"\\n\
-      Icon=utilities-terminal\\n\
-      Terminal=false\\n\
-      Categories=Science;MedicalSoftware;Graphics;\\n\"
-    )\n  ")
 endif()
 
 # CPack 配置（用于生成安装包）
@@ -309,9 +235,8 @@ set(CPACK_PACKAGE_VERSION "1.0.0")
 set(CPACK_PACKAGE_DESCRIPTION "Medical Image Analysis Software with AI Classification")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "DICOM viewer with FAI classification using YOLO")
 
-# 平台特定的CPack配置
+# Windows 特定配置
 if(WIN32)
-  # Windows 特定配置
   set(CPACK_GENERATOR "NSIS")
   set(CPACK_PACKAGE_INSTALL_DIRECTORY "MedYOLO11Qt")
   set(CPACK_NSIS_DISPLAY_NAME "MedYOLO11Qt")
@@ -322,26 +247,16 @@ if(WIN32)
   set(CPACK_NSIS_MENU_LINKS
       "bin/medapp.exe" "MedYOLO11Qt"
   )
-  set(CPACK_DESKTOP_SHORTCUTS
-      "MedYOLO11Qt" "bin/medapp.exe"
+  set(CPACK_NSIS_CREATE_ICONS_EXTRA 
+      "CreateShortCut \"\$SMPROGRAMS\\MedYOLO11Qt.lnk\" \"\$INSTDIR\\bin\\medapp.exe\""
+      "CreateShortCut \"\$DESKTOP\\MedYOLO11Qt.lnk\" \"\$INSTDIR\\bin\\medapp.exe\""
   )
-  
-  # 手动指定NSIS编译器路径
-  set(CMAKE_NSIS_COMPILER "E:/tools/NSIS/makensis.exe")
-else()
-  # Linux 特定配置
-  set(CPACK_GENERATOR "DEB;TGZ")
-  set(CPACK_PACKAGE_NAME "medyolo11qt")
-  set(CPACK_PACKAGE_CONTACT "Your Name <your.email@example.com>")
-  set(CPACK_DEBIAN_PACKAGE_MAINTAINER "Your Name <your.email@example.com>")
-  
-  # 指定Debian包依赖
-  set(CPACK_DEBIAN_PACKAGE_DEPENDS "qt6-base (>= 6.0), libgdcm3.0 (>= 3.0), onnxruntime (>= 1.10)")
-  
-  # 设置安装路径前缀
-  if(NOT DEFINED CMAKE_INSTALL_PREFIX)
-    set(CMAKE_INSTALL_PREFIX /usr/local)
-  endif()
+  set(CPACK_NSIS_DELETE_ICONS_EXTRA 
+      "Delete \"\$SMPROGRAMS\\MedYOLO11Qt.lnk\""
+      "Delete \"\$DESKTOP\\MedYOLO11Qt.lnk\""
+  )
 endif()
 
+# 手动指定NSIS编译器路径
+set(CMAKE_NSIS_COMPILER "E:/tools/NSIS/makensis.exe")
 include(CPack)
