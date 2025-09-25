@@ -25,6 +25,29 @@
 #include <QTimer>
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) { setupUi(); }
+
+void MainWindow::setTaskType(TaskSelectionDialog::TaskType taskType)
+{
+    // 根据任务类型隐藏/显示相应的UI元素
+    if (taskType == TaskSelectionDialog::MRI_Segmentation)
+    {
+        // MRI分割模式：显示MRI加载按钮，隐藏X光加载按钮
+        if (m_actLoadMRI)
+            m_actLoadMRI->setVisible(true);
+        if (m_actLoadFAI)
+            m_actLoadFAI->setVisible(false);
+        // 可以在这里添加其他MRI特定的UI调整
+    }
+    else
+    {
+        // X光检测模式：显示X光加载按钮，隐藏MRI加载按钮
+        if (m_actLoadFAI)
+            m_actLoadFAI->setVisible(true);
+        if (m_actLoadMRI)
+            m_actLoadMRI->setVisible(false);
+        // 可以在这里添加其他X光特定的UI调整
+    }
+}
 void MainWindow::setupUi()
 {
     auto *tb = addToolBar("Main");
@@ -34,7 +57,8 @@ void MainWindow::setupUi()
 
     tb->addSeparator();
 
-    auto *actLoadFAI = tb->addAction("Load FAI ONNX");
+    m_actLoadFAI = tb->addAction("Load FAI ONNX");
+    m_actLoadFAI->setVisible(false); // 初始隐藏
     m_actRun = tb->addAction("Run Inference");
 
     tb->addSeparator();
@@ -44,7 +68,7 @@ void MainWindow::setupUi()
     connect(actOpenImg, &QAction::triggered, this, &MainWindow::openImage);
     connect(actOpenDicom, &QAction::triggered, this, &MainWindow::openDicom);
     connect(actOpenFolder, &QAction::triggered, this, &MainWindow::openFolder);
-    connect(actLoadFAI, &QAction::triggered, this, &MainWindow::loadFAIModel);
+    connect(m_actLoadFAI, &QAction::triggered, this, &MainWindow::loadFAIModel);
     connect(m_actRun, &QAction::triggered, this, &MainWindow::runInference);
     connect(actClear, &QAction::triggered, this, &MainWindow::clearAll);
 
@@ -128,6 +152,17 @@ void MainWindow::setupUi()
 
     m_actBatch = tb->addAction("Batch Infer");
     connect(m_actBatch, &QAction::triggered, this, &MainWindow::runBatchInference);
+
+    // 添加MRI分割功能（初始隐藏，根据任务类型显示）
+    tb->addSeparator();
+    m_actLoadMRI = tb->addAction("Load MRI Model");
+    connect(m_actLoadMRI, &QAction::triggered, this, &MainWindow::loadMRIModel);
+    m_actLoadMRI->setVisible(false); // 初始隐藏
+
+    // 添加任务切换按钮
+    tb->addSeparator();
+    auto *actSwitchTask = tb->addAction("Switch Task");
+    connect(actSwitchTask, &QAction::triggered, this, &MainWindow::switchTask);
 
     // 初始：未加载模型时禁用推理/导出/批处理
     for (QAction *a : {m_actRun, m_actBatch, m_actExport, m_actExportAll})
@@ -221,7 +256,7 @@ void MainWindow::onListActivated()
         m_lastDets = m_cacheDets.value(sel);
         setOutputImage(m_output);
     }
-    else if (m_modelReady)
+    else if (m_modelReady || m_mriModelReady)
     {
         // 自动对当前文件推理一次
         runInference();
@@ -231,6 +266,7 @@ void MainWindow::onListActivated()
         // 未加载模型且没有缓存：清空输出
         m_output = QImage();
         m_lastDets.clear();
+        m_segmentationMask = QImage();
         m_outputView->clearImage();
     }
 }
@@ -242,12 +278,24 @@ void MainWindow::runInference()
         return;
     }
 
-    if (!m_modelReady)
+    if (!m_modelReady && !m_mriModelReady)
     {
         QMessageBox::information(this, "Run Inference", "Please load an ONNX model first.");
         return;
     }
-    auto result = m_engine.run(m_input, InferenceEngine::Task::FAI_XRay);
+
+    InferenceEngine::Result result;
+    if (m_modelReady)
+    {
+        // X光检测任务
+        result = m_engine.run(m_input, InferenceEngine::Task::FAI_XRay);
+    }
+    else if (m_mriModelReady)
+    {
+        // MRI分割任务
+        result = m_mriEngine.run(m_input, InferenceEngine::Task::HipMRI_Seg);
+        m_segmentationMask = result.segmentationMask;
+    }
 
     // —— 写入缓存（以当前路径为 key）——
     if (!m_currentPath.isEmpty())
@@ -318,7 +366,15 @@ void MainWindow::runBatchInference()
             continue;
         }
 
-        auto res = m_engine.run(in, InferenceEngine::Task::FAI_XRay);
+        InferenceEngine::Result res;
+        if (m_modelReady)
+        {
+            res = m_engine.run(in, InferenceEngine::Task::FAI_XRay);
+        }
+        else if (m_mriModelReady)
+        {
+            res = m_mriEngine.run(in, InferenceEngine::Task::HipMRI_Seg);
+        }
         m_cacheImg[path] = res.outputImage;
         m_cacheDets[path] = res.dets;
         ++ok;
@@ -363,6 +419,57 @@ void MainWindow::loadFAIModel()
     log(QString("FAI ONNX loaded: %1").arg(modelPath));
 }
 
+void MainWindow::loadMRIModel()
+{
+    // 使用相对路径加载MRI分割模型
+    QString modelPath = QCoreApplication::applicationDirPath() + "/models/mri_segmentation.onnx";
+
+    // 检查文件是否存在
+    if (!QFileInfo::exists(modelPath))
+    {
+        QMessageBox::warning(this, "Load MRI Model",
+                             QString("MRI model file not found at: %1").arg(modelPath));
+        return;
+    }
+
+    m_mriOnnxPath = modelPath;
+    m_mriModelReady = m_mriEngine.loadModel(m_mriOnnxPath, InferenceEngine::Task::HipMRI_Seg);
+    if (!m_mriModelReady)
+    {
+        QMessageBox::warning(this, "Load MRI Model", "Failed to load MRI ONNX model.");
+        return;
+    }
+    for (QAction *a : {m_actRun, m_actBatch, m_actExport, m_actExportAll})
+        if (a)
+            a->setEnabled(true);
+
+    log(QString("MRI Segmentation ONNX loaded: %1").arg(modelPath));
+}
+
+void MainWindow::switchTask()
+{
+    TaskSelectionDialog dialog;
+    if (dialog.exec() == QDialog::Accepted)
+    {
+        setTaskType(dialog.selectedTask());
+
+        // 清除当前状态，因为切换任务需要重新开始
+        clearAll();
+
+        // 根据新任务类型更新窗口标题
+        if (dialog.selectedTask() == TaskSelectionDialog::MRI_Segmentation)
+        {
+            setWindowTitle("Med YOLO11 Qt - MRI Segmentation");
+        }
+        else
+        {
+            setWindowTitle("Med YOLO11 Qt - FAI X-Ray Detection");
+        }
+
+        log("Task switched");
+    }
+}
+
 void MainWindow::clearAll()
 {
     m_input = QImage();
@@ -372,6 +479,7 @@ void MainWindow::clearAll()
     m_currentPath.clear();
     m_batch.clear();
     m_list->clear();
+    m_segmentationMask = QImage();
     statusBar()->showMessage("Cleared");
 }
 

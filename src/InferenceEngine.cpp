@@ -4,6 +4,10 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <QFile>
+#include <QByteArray>
+#include <QCryptographicHash>
+#include <QDataStream>
 
 #ifdef HAVE_ORT
 #include <onnxruntime_cxx_api.h>
@@ -168,17 +172,76 @@ QColor InferenceEngine::classColor(int cls)
 InferenceEngine::InferenceEngine() = default;
 InferenceEngine::~InferenceEngine() = default;
 
+// 添加XOR解密函数
+QByteArray xorDecrypt(const QByteArray &data, const QByteArray &key)
+{
+    QByteArray result;
+    result.resize(data.size());
+
+    for (int i = 0; i < data.size(); ++i)
+    {
+        result[i] = data[i] ^ key[i % key.size()];
+    }
+
+    return result;
+}
+
 bool InferenceEngine::loadModel(const QString &path, Task /*taskHint*/)
 {
 #ifndef HAVE_ORT
     qWarning() << "Built without ONNXRuntime";
     return false;
 #else
+    // 读取加密的模型文件
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly))
+    {
+        qWarning() << "Failed to open model file:" << path;
+        return false;
+    }
+
+    QByteArray fileData = file.readAll();
+    file.close();
+
+    // 检查文件头（至少8字节）
+    if (fileData.size() < 8)
+    {
+        qWarning() << "Model file too small or corrupted";
+        return false;
+    }
+
+    // 读取文件头
+    QDataStream headerStream(fileData);
+    quint32 magic, version;
+    headerStream >> magic >> version;
+
+    // 验证魔数
+    if (magic != 0x4D594F4C)
+    { // "MYOL"
+        qWarning() << "Invalid model file format or not encrypted";
+        return false;
+    }
+
+    // 解密模型数据
+    QByteArray encryptedData = fileData.mid(8); // 跳过8字节文件头
+
+    QByteArray key = QCryptographicHash::hash(
+        "MedYOLO11Qt_Model_Protection_Key_2024",
+        QCryptographicHash::Sha256);
+
+    QByteArray modelData = xorDecrypt(encryptedData, key);
+
     m_ort = std::make_unique<OrtPack>();
     m_ort->opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+
     try
     {
-        m_ort->session = std::make_unique<Ort::Session>(m_ort->env, path.toStdWString().c_str(), m_ort->opts);
+        // 使用内存中的模型数据创建session
+        m_ort->session = std::make_unique<Ort::Session>(
+            m_ort->env,
+            modelData.constData(),
+            modelData.size(),
+            m_ort->opts);
     }
     catch (const Ort::Exception &e)
     {
@@ -266,10 +329,175 @@ bool InferenceEngine::loadModel(const QString &path, Task /*taskHint*/)
 #endif
 }
 
-InferenceEngine::Result InferenceEngine::run(const QImage &input, Task /*taskHint*/) const
+bool InferenceEngine::isSegmentationModel() const
+{
+#ifndef HAVE_ORT
+    return false;
+#else
+    if (!m_ort || !m_ort->session)
+        return false;
+
+    // 检查输出形状来判断是否为分割模型
+    // 分割模型通常有 [1, num_classes, H, W] 形状的输出
+    const size_t no = m_ort->session->GetOutputCount();
+    for (size_t i = 0; i < no; ++i)
+    {
+        auto to = m_ort->session->GetOutputTypeInfo(i);
+        if (to.GetONNXType() != ONNX_TYPE_TENSOR)
+            continue;
+        auto inf = to.GetTensorTypeAndShapeInfo();
+        if (inf.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+            continue;
+        auto sh = inf.GetShape();
+        if (sh.size() == 4 && sh[0] == 1 && sh[1] > 1) // [1, C, H, W]
+        {
+            return true;
+        }
+    }
+    return false;
+#endif
+}
+
+QImage InferenceEngine::processSegmentation(const QImage &input) const
+{
+#ifndef HAVE_ORT
+    return QImage();
+#else
+    if (!m_ort || !m_ort->session || !isSegmentationModel())
+        return QImage();
+
+    // 预处理：调整到模型输入尺寸
+    QImage rgb = input.convertToFormat(QImage::Format_RGB888);
+    QImage resized = rgb.scaled(m_inW, m_inH, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+
+    std::vector<float> tensor(3 * m_inH * m_inW);
+    for (int y = 0; y < m_inH; ++y)
+    {
+        const uchar *line = resized.constScanLine(y);
+        for (int x = 0; x < m_inW; ++x)
+        {
+            int idx = y * m_inW + x;
+            tensor[0 * m_inH * m_inW + idx] = line[3 * x + 0] / 255.f;
+            tensor[1 * m_inH * m_inW + idx] = line[3 * x + 1] / 255.f;
+            tensor[2 * m_inH * m_inW + idx] = line[3 * x + 2] / 255.f;
+        }
+    }
+
+    Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator, OrtMemTypeDefault);
+    std::array<int64_t, 4> ishape{1, 3, m_inH, m_inW};
+    Ort::Value in = Ort::Value::CreateTensor<float>(mem, tensor.data(), tensor.size(), ishape.data(), ishape.size());
+
+    // 找到分割输出（形状为 [1, C, H, W]）
+    const size_t no = m_ort->session->GetOutputCount();
+    int segOutputIndex = -1;
+    for (size_t i = 0; i < no; ++i)
+    {
+        auto to = m_ort->session->GetOutputTypeInfo(i);
+        if (to.GetONNXType() != ONNX_TYPE_TENSOR)
+            continue;
+        auto inf = to.GetTensorTypeAndShapeInfo();
+        if (inf.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+            continue;
+        auto sh = inf.GetShape();
+        if (sh.size() == 4 && sh[0] == 1 && sh[1] > 1)
+        {
+            segOutputIndex = i;
+            break;
+        }
+    }
+
+    if (segOutputIndex == -1)
+        return QImage();
+
+    const char *outName = m_ort->outputNames[segOutputIndex];
+    std::vector<Ort::Value> outs;
+    try
+    {
+        outs = m_ort->session->Run(Ort::RunOptions{nullptr},
+                                   m_ort->inputNames.data(), &in, 1,
+                                   &outName, 1);
+    }
+    catch (const Ort::Exception &e)
+    {
+        qWarning() << "Segmentation inference failed:" << e.what();
+        return QImage();
+    }
+
+    if (outs.empty() || !outs[0].IsTensor())
+        return QImage();
+
+    const float *data = outs[0].GetTensorData<float>();
+    auto info = outs[0].GetTensorTypeAndShapeInfo();
+    auto sh = info.GetShape(); // [1, C, H, W]
+
+    const int num_classes = sh[1];
+    const int seg_h = sh[2];
+    const int seg_w = sh[3];
+
+    // 创建分割掩码图像
+    QImage mask(seg_w, seg_h, QImage::Format_ARGB32);
+
+    // 简单的argmax处理：取每个位置概率最大的类别
+    for (int y = 0; y < seg_h; ++y)
+    {
+        QRgb *scanline = reinterpret_cast<QRgb *>(mask.scanLine(y));
+        for (int x = 0; x < seg_w; ++x)
+        {
+            int max_class = 0;
+            float max_val = -FLT_MAX;
+
+            for (int c = 0; c < num_classes; ++c)
+            {
+                float val = data[c * seg_h * seg_w + y * seg_w + x];
+                if (val > max_val)
+                {
+                    max_val = val;
+                    max_class = c;
+                }
+            }
+
+            // 为不同类别分配不同颜色
+            QColor color;
+            switch (max_class)
+            {
+            case 0:
+                color = QColor(255, 0, 0, 128);
+                break; // 红色 - 背景
+            case 1:
+                color = QColor(0, 255, 0, 128);
+                break; // 绿色 - 骨骼
+            case 2:
+                color = QColor(0, 0, 255, 128);
+                break; // 蓝色 - 软组织
+            case 3:
+                color = QColor(255, 255, 0, 128);
+                break; // 黄色 - 其他
+            default:
+                color = QColor(128, 128, 128, 128);
+            }
+
+            scanline[x] = color.rgba();
+        }
+    }
+
+    return mask.scaled(input.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+#endif
+}
+
+InferenceEngine::Result InferenceEngine::run(const QImage &input, Task taskHint) const
 {
     Result R;
     QImage vis = input.convertToFormat(QImage::Format_ARGB32);
+
+    // 根据任务类型选择处理方式
+    if (taskHint == Task::HipMRI_Seg && isSegmentationModel())
+    {
+        // MRI分割任务
+        R.segmentationMask = processSegmentation(input);
+        R.outputImage = input;
+        R.summary = "MRI segmentation completed";
+        return R;
+    }
 #ifndef HAVE_ORT
     R.outputImage = vis;
     R.summary = "Built without ONNXRuntime";

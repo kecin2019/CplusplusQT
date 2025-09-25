@@ -28,6 +28,7 @@ public:
         QImage outputImage;          // 已绘制框的图
         QString summary;             // 统计摘要
         std::vector<Detection> dets; // 检测框
+        QImage segmentationMask;     // 分割掩码图像（仅用于分割任务）
     };
 
     InferenceEngine();
@@ -35,6 +36,10 @@ public:
 
     bool loadModel(const QString &weightsPath, Task taskHint);
     Result run(const QImage &input, Task taskHint) const;
+
+    // MRI分割专用方法
+    bool isSegmentationModel() const;
+    QImage processSegmentation(const QImage &input) const;
 
     void setThresholds(float conf, float iou)
     {

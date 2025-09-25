@@ -5,4 +5,4 @@ test
 weights
 .vs
 vcpkg_installed
-*.onnx
+models
