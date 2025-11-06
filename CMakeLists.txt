@@ -54,7 +54,7 @@ set(QT_INSTALL_PATH "E:/tools/Qt/6.9.2/msvc2022_64" CACHE PATH "Qt 6 安装路�
 set(CMAKE_PREFIX_PATH ${QT_INSTALL_PATH})
 
 # 查找 Qt6 组件
-find_package(Qt6 REQUIRED COMPONENTS Widgets)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Concurrent)
 
 # Qt 版本信息输出
 message(STATUS "Qt 版本: ${Qt6_VERSION}")
@@ -188,6 +188,7 @@ target_include_directories(medapp PRIVATE
 # 链接库
 target_link_libraries(medapp PRIVATE 
   Qt6::Widgets 
+  Qt6::Concurrent
   ${GDCM_LIBS}       # 链接GDCM库
   ${ONNXRUNTIME_LIB} # 链接ONNX库
 )
@@ -350,3 +351,4 @@ endif()
 # 手动指定NSIS编译器路径
 set(CMAKE_NSIS_COMPILER "E:/tools/NSIS/makensis.exe")
 include(CPack)
+

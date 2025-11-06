@@ -25,13 +25,38 @@
 #include <QFile>
 #include <qapplication.h>
 #include <QTimer>
+#include <QStringList>
+#include <QProgressDialog>
+#include <QPointer>
+#include <QtConcurrent>
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
 {
     // 初始化配置和错误处理器
     AppConfig::instance().loadConfig();
 
+    m_singleWatcher.setParent(this);
+    m_batchWatcher.setParent(this);
+    connect(&m_singleWatcher, &QFutureWatcher<InferenceEngine::Result>::finished,
+            this, &MainWindow::handleSingleInferenceFinished);
+    connect(&m_batchWatcher, &QFutureWatcher<std::vector<BatchItem>>::finished,
+            this, &MainWindow::handleBatchInferenceFinished);
+
     setupUi();
+}
+
+MainWindow::~MainWindow()
+{
+    if (m_singleWatcher.isRunning())
+    {
+        m_singleWatcher.cancel();
+        m_singleWatcher.waitForFinished();
+    }
+    if (m_batchWatcher.isRunning())
+    {
+        m_batchWatcher.cancel();
+        m_batchWatcher.waitForFinished();
+    }
 }
 
 void MainWindow::setTaskType(TaskSelectionDialog::TaskType taskType)
@@ -44,7 +69,6 @@ void MainWindow::setTaskType(TaskSelectionDialog::TaskType taskType)
             m_actLoadMRI->setVisible(true);
         if (m_actLoadFAI)
             m_actLoadFAI->setVisible(false);
-        // 可以在这里添加其他MRI特定的UI调整
     }
     else
     {
@@ -53,8 +77,8 @@ void MainWindow::setTaskType(TaskSelectionDialog::TaskType taskType)
             m_actLoadFAI->setVisible(true);
         if (m_actLoadMRI)
             m_actLoadMRI->setVisible(false);
-        // 可以在这里添加其他X光特定的UI调整
     }
+    refreshActionStates();
 }
 void MainWindow::setupUi()
 {
@@ -208,6 +232,8 @@ QHeaderView::section {
 
 QStatusBar { background:#F7F8FA; border-top:1px solid #E4E7EC; }
 )");
+
+    refreshActionStates();
 }
 void MainWindow::openImage()
 {
@@ -280,6 +306,12 @@ void MainWindow::onListActivated()
 }
 void MainWindow::runInference()
 {
+    if (m_isInferenceRunning || m_isBatchRunning)
+    {
+        statusBar()->showMessage("Inference already running...");
+        return;
+    }
+
     if (m_input.isNull())
     {
         QMessageBox::information(this, "Run Inference", "Please load an image first.");
@@ -292,45 +324,31 @@ void MainWindow::runInference()
         return;
     }
 
-    try
-    {
-        InferenceEngine::Result result;
-        if (m_modelReady)
-        {
-            // X光检测任务
-            result = m_engine.run(m_input, InferenceEngine::Task::FAI_XRay);
-        }
-        else if (m_mriModelReady)
-        {
-            // MRI分割任务
-            result = m_mriEngine.run(m_input, InferenceEngine::Task::HipMRI_Seg);
-            m_segmentationMask = result.segmentationMask;
-        }
+    m_isInferenceRunning = true;
+    m_pendingInferencePath = m_currentPath;
+    m_pendingTask = m_modelReady ? InferenceEngine::Task::FAI_XRay : InferenceEngine::Task::HipMRI_Seg;
 
-        // —— 写入缓存（以当前路径为 key）——
-        if (!m_currentPath.isEmpty())
-        {
-            m_cacheImg[m_currentPath] = result.outputImage;
-            m_cacheDets[m_currentPath] = result.dets;
-        }
+    setBusyState(true, "Running inference...");
 
-        m_output = result.outputImage;
-        m_lastDets = result.dets;
+    const QImage inputCopy = m_input;
+    const InferenceEngine::Task task = m_pendingTask;
 
-        setOutputImage(result.outputImage);
-        log(QString("Inference: %1").arg(result.summary));
-        statusBar()->showMessage("Inference done");
-    }
-    catch (const std::exception &e)
-    {
-        QString errorMsg = QString("Inference error: %1").arg(e.what());
-        LOG_ERROR(errorMsg, "Inference", 1001);
-        QMessageBox::critical(this, "Inference Error", errorMsg);
-    }
+    auto future = QtConcurrent::run([this, inputCopy, task]() {
+        if (task == InferenceEngine::Task::HipMRI_Seg)
+            return m_mriEngine.run(inputCopy, task);
+        return m_engine.run(inputCopy, task);
+    });
+    m_singleWatcher.setFuture(future);
 }
 
 void MainWindow::runBatchInference()
 {
+    if (m_isInferenceRunning || m_isBatchRunning)
+    {
+        statusBar()->showMessage("Inference already running...");
+        return;
+    }
+
     if (!m_modelReady && !m_mriModelReady)
     {
         QMessageBox::information(this, "Batch Export", "Please load an ONNX model first.");
@@ -343,80 +361,230 @@ void MainWindow::runBatchInference()
         return;
     }
 
-    try
-    {
-        int ok = 0, fail = 0;
-        for (int i = 0; i < m_list->count(); ++i)
+    QStringList paths;
+    paths.reserve(m_list->count());
+    for (int i = 0; i < m_list->count(); ++i)
+        paths.append(m_list->item(i)->text());
+
+    const int total = paths.size();
+    m_isBatchRunning = true;
+    setBusyState(true, "Running batch inference...", total);
+
+    const InferenceEngine::Task task = m_modelReady ? InferenceEngine::Task::FAI_XRay : InferenceEngine::Task::HipMRI_Seg;
+    QPointer<MainWindow> guard(this);
+
+    auto future = QtConcurrent::run([this, guard, task, paths = std::move(paths)]() -> std::vector<BatchItem> {
+        std::vector<BatchItem> results;
+        results.reserve(static_cast<size_t>(paths.size()));
+        int index = 0;
+        const int totalCount = static_cast<int>(paths.size());
+        for (const QString &path : paths)
         {
-            const QString path = m_list->item(i)->text();
+            BatchItem item;
+            item.path = path;
+            QImage image;
+            QString error;
+            bool ok = false;
 
-            // 已有缓存则跳过（如需强制重跑，可清缓存）
-            if (m_cacheImg.contains(path))
+            if (isImageFile(path))
             {
-                ++ok;
-                continue;
+                ok = image.load(path);
+                if (!ok)
+                    error = QStringLiteral("Failed to load image: %1").arg(path);
             }
-
-            QImage in;
-            if (isDicomFile(path))
+            else if (isDicomFile(path))
             {
-#ifdef HAVE_GDCM
-                QMap<QString, QString> dummy;
-                if (!DicomUtils::loadDicomToQImage(path, in, &dummy))
-                {
-                    ++fail;
-                    continue;
-                }
-#else
-                ++fail;
-                continue;
-#endif
-            }
-            else if (isImageFile(path))
-            {
-                if (!in.load(path))
-                {
-                    ++fail;
-                    continue;
-                }
+    #ifdef HAVE_GDCM
+                ok = DicomUtils::loadDicomToQImage(path, image, nullptr);
+                if (!ok)
+                    error = QStringLiteral("Failed to load DICOM: %1").arg(path);
+    #else
+                error = QStringLiteral("Built without GDCM support");
+    #endif
             }
             else
             {
-                ++fail;
-                continue;
+                error = QStringLiteral("Unsupported file: %1").arg(path);
             }
 
-            InferenceEngine::Result res;
-            if (m_modelReady)
+            if (ok)
             {
-                res = m_engine.run(in, InferenceEngine::Task::FAI_XRay);
+                item.success = true;
+                item.result = (task == InferenceEngine::Task::HipMRI_Seg)
+                                   ? m_mriEngine.run(image, task)
+                                   : m_engine.run(image, task);
             }
-            else if (m_mriModelReady)
+            else
             {
-                res = m_mriEngine.run(in, InferenceEngine::Task::HipMRI_Seg);
+                item.success = false;
+                item.error = error;
             }
-            m_cacheImg[path] = res.outputImage;
-            m_cacheDets[path] = res.dets;
-            ++ok;
 
-            // UI 反馈（可选）：边跑边显示当前
-            if (path == m_currentPath)
+            results.push_back(item);
+            ++index;
+            if (guard)
             {
-                m_output = res.outputImage;
-                m_lastDets = res.dets;
-                setOutputImage(m_output);
+                QMetaObject::invokeMethod(guard, [guard, index, totalCount]() {
+                    if (guard)
+                        guard->updateProgressValue(index, totalCount);
+                }, Qt::QueuedConnection);
             }
-            qApp->processEvents();
         }
-        QMessageBox::information(this, "Batch Infer",
-                                 QString("Done. Success: %1, Failed: %2").arg(ok).arg(fail));
-    }
-    catch (const std::exception &e)
+        return results;
+    });
+
+    m_batchWatcher.setFuture(future);
+}
+
+void MainWindow::refreshActionStates()
+{
+    const bool busy = m_isInferenceRunning || m_isBatchRunning;
+    const bool hasModel = m_modelReady || m_mriModelReady;
+
+    if (m_actRun)
+        m_actRun->setEnabled(hasModel && !busy);
+    if (m_actBatch)
+        m_actBatch->setEnabled(hasModel && !busy);
+    if (m_actExportAll)
+        m_actExportAll->setEnabled(hasModel && !busy);
+    if (m_actExport)
+        m_actExport->setEnabled(!m_output.isNull() && !busy);
+}
+
+void MainWindow::setBusyState(bool busy, const QString &message, int maximum)
+{
+    if (busy)
     {
-        QString errorMsg = QString("Batch inference error: %1").arg(e.what());
-        LOG_ERROR(errorMsg, "BatchInference", 1002);
-        QMessageBox::critical(this, "Batch Inference Error", errorMsg);
+        if (!m_progressDialog)
+        {
+            m_progressDialog = new QProgressDialog(message, QString(), 0, 0, this);
+            m_progressDialog->setCancelButton(nullptr);
+            m_progressDialog->setWindowModality(Qt::WindowModal);
+            m_progressDialog->setMinimumDuration(0);
+            m_progressDialog->setAutoClose(false);
+            m_progressDialog->setAutoReset(false);
+        }
+        m_progressDialog->setLabelText(message);
+        if (maximum > 0)
+        {
+            m_progressDialog->setRange(0, maximum);
+            m_progressDialog->setValue(0);
+        }
+        else
+        {
+            m_progressDialog->setRange(0, 0);
+        }
+        m_progressDialog->show();
+        statusBar()->showMessage(message);
     }
+    else if (m_progressDialog)
+    {
+        m_progressDialog->hide();
+    }
+
+    if (m_list)
+        m_list->setEnabled(!busy);
+    if (m_actLoadFAI)
+        m_actLoadFAI->setEnabled(!busy);
+    if (m_actLoadMRI)
+        m_actLoadMRI->setEnabled(!busy);
+
+    refreshActionStates();
+}
+
+void MainWindow::updateProgressValue(int value, int maximum)
+{
+    if (!m_progressDialog)
+        return;
+    if (maximum > 0)
+    {
+        if (m_progressDialog->maximum() != maximum)
+            m_progressDialog->setRange(0, maximum);
+        m_progressDialog->setValue(value);
+    }
+    else
+    {
+        m_progressDialog->setRange(0, 0);
+    }
+}
+
+void MainWindow::handleSingleInferenceFinished()
+{
+    m_isInferenceRunning = false;
+    setBusyState(false, QString());
+
+    if (!m_singleWatcher.future().isFinished())
+    {
+        refreshActionStates();
+        return;
+    }
+
+    InferenceEngine::Result result = m_singleWatcher.result();
+
+    if (!m_pendingInferencePath.isEmpty())
+    {
+        m_cacheImg[m_pendingInferencePath] = result.outputImage;
+        m_cacheDets[m_pendingInferencePath] = result.dets;
+    }
+    m_pendingInferencePath.clear();
+
+    m_output = result.outputImage;
+    m_lastDets = result.dets;
+    m_segmentationMask = result.segmentationMask;
+
+    if (!result.outputImage.isNull())
+        setOutputImage(result.outputImage);
+    else
+        m_outputView->clearImage();
+
+    statusBar()->showMessage(result.summary, 5000);
+    LOG_INFO(QStringLiteral("Inference summary: %1").arg(result.summary), "Inference");
+
+    refreshActionStates();
+}
+
+void MainWindow::handleBatchInferenceFinished()
+{
+    m_isBatchRunning = false;
+    setBusyState(false, QString());
+
+    if (!m_batchWatcher.future().isFinished())
+    {
+        refreshActionStates();
+        return;
+    }
+
+    std::vector<BatchItem> results = m_batchWatcher.result();
+    int ok = 0;
+    int fail = 0;
+
+    for (const auto &item : results)
+    {
+        if (!item.success)
+        {
+            ++fail;
+            LOG_WARNING(QStringLiteral("Batch inference failed: %1 (%2)").arg(item.path, item.error), "BatchInference", 1003);
+            continue;
+        }
+
+        ++ok;
+        m_cacheImg[item.path] = item.result.outputImage;
+        m_cacheDets[item.path] = item.result.dets;
+
+        if (item.path == m_currentPath)
+        {
+            m_output = item.result.outputImage;
+            m_lastDets = item.result.dets;
+            m_segmentationMask = item.result.segmentationMask;
+            setOutputImage(item.result.outputImage);
+            statusBar()->showMessage(item.result.summary, 5000);
+        }
+    }
+
+    refreshActionStates();
+
+    QMessageBox::information(this, "Batch Infer",
+                             QString("Done. Success: %1, Failed: %2").arg(ok).arg(fail));
 }
 
 void MainWindow::loadFAIModel()
@@ -454,9 +622,7 @@ void MainWindow::loadFAIModel()
             QMessageBox::warning(this, "Load Model", errorMsg);
             return;
         }
-        for (QAction *a : {m_actRun, m_actBatch, m_actExport, m_actExportAll})
-            if (a)
-                a->setEnabled(true);
+        refreshActionStates();
 
         log(QString("FAI ONNX loaded: %1").arg(modelPath));
     }
@@ -503,9 +669,7 @@ void MainWindow::loadMRIModel()
             QMessageBox::warning(this, "Load MRI Model", errorMsg);
             return;
         }
-        for (QAction *a : {m_actRun, m_actBatch, m_actExport, m_actExportAll})
-            if (a)
-                a->setEnabled(true);
+        refreshActionStates();
 
         log(QString("MRI Segmentation ONNX loaded: %1").arg(modelPath));
     }
@@ -544,14 +708,18 @@ void MainWindow::switchTask()
 void MainWindow::clearAll()
 {
     m_input = QImage();
+    m_output = QImage();
+    m_lastDets.clear();
     m_inputView->clearImage();
     m_outputView->clearImage();
     m_meta->clearAll();
     m_currentPath.clear();
     m_batch.clear();
-    m_list->clear();
+    if (m_list)
+        m_list->clear();
     m_segmentationMask = QImage();
     statusBar()->showMessage("Cleared");
+    refreshActionStates();
 }
 
 void MainWindow::log(const QString &s)
@@ -568,10 +736,11 @@ void MainWindow::setInputImage(const QImage &img)
 }
 void MainWindow::setOutputImage(const QImage &img)
 {
-    // 结果图不再重新 fit，直接保持与输入图相同缩放
+    // ���ͼ�������� fit��ֱ�ӱ���������ͼ��ͬ����
     m_outputView->setImage(img, false);
     m_outputView->setTransform(m_inputView->transform());
     m_viewTabs->setCurrentWidget(m_outputView);
+    refreshActionStates();
 }
 void MainWindow::updateMetaTable(const QMap<QString, QString> &meta) { m_meta->setData(meta); }
 bool MainWindow::isImageFile(const QString &path)
@@ -831,3 +1000,5 @@ bool MainWindow::saveJson(const QString &jsonPath,
     f.close();
     return true;
 }
+
+
