@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/styles">
+        <file>styles/modern_light.qss</file>
+    </qresource>
+</RCC>

@@ -174,6 +174,7 @@ set(SRC ${CORE_SRC} ${AI_SRC} ${UI_SRC} ${MEDICAL_SRC})
 
 # ---------------- 目标配置 ----------------
 add_executable(medapp ${SRC})
+qt_add_resources(medapp app_styles resources/resources.qrc)
 target_include_directories(medapp PRIVATE 
   src 
   src/core

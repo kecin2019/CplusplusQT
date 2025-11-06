@@ -10,8 +10,8 @@
 #include <QByteArray>
 #include <QCryptographicHash>
 #include <QDataStream>
-#include "AppConfig.h"
-#include "ErrorHandler.h"
+#include "core/AppConfig.h"
+#include "core/ErrorHandler.h"
 
 #ifdef HAVE_ORT
 #include <onnxruntime_cxx_api.h>
@@ -263,7 +263,7 @@ namespace
     }
 #endif
 
-        class EncryptedModelLoader
+    class EncryptedModelLoader
     {
     public:
         struct LoadInfo
@@ -272,6 +272,7 @@ namespace
             quint32 version{0};
         };
 
+        // 修改 EncryptedModelLoader::load 方法，增加更详细的错误信息
         static std::optional<LoadInfo> load(const QString &path, const QByteArray &key, QString *errorMessage = nullptr)
         {
             if (path.isEmpty())
@@ -285,7 +286,7 @@ namespace
             if (!file.open(QIODevice::ReadOnly))
             {
                 if (errorMessage)
-                    *errorMessage = QStringLiteral("无法打开模型文件: %1").arg(path);
+                    *errorMessage = QStringLiteral("无法打开模型文件: %1，错误: %2").arg(path).arg(file.errorString());
                 return std::nullopt;
             }
 
@@ -294,8 +295,18 @@ namespace
 
             if (fileData.size() < kModelHeaderSize)
             {
-                if (errorMessage)
-                    *errorMessage = QStringLiteral("模型文件头损坏: %1").arg(path);
+                // 增加对未加密文件的检测
+                QFileInfo info(path);
+                if (info.suffix().toLower() == "onnx")
+                {
+                    if (errorMessage)
+                        *errorMessage = QStringLiteral("检测到未加密的ONNX文件，请先使用encrypt_model工具加密: %1").arg(path);
+                }
+                else
+                {
+                    if (errorMessage)
+                        *errorMessage = QStringLiteral("模型文件过小或损坏: %1，大小: %2字节").arg(path).arg(fileData.size());
+                }
                 return std::nullopt;
             }
 
@@ -311,6 +322,13 @@ namespace
                 return std::nullopt;
             }
 
+            // 添加更多调试信息
+            if (AppConfig::instance().isDebugModeEnabled())
+            {
+                qDebug() << "模型版本:" << version;
+                qDebug() << "加密数据大小:" << fileData.size() - kModelHeaderSize;
+            }
+
             QByteArray encryptedPayload = fileData.mid(kModelHeaderSize);
             LoadInfo info;
             info.version = version;
@@ -318,67 +336,90 @@ namespace
             return info;
         }
     };
-        };
+}
 
-        static std::optional<LoadInfo> load(const QString &path, const QByteArray &key, QString *errorMessage = nullptr)
+#ifdef HAVE_ORT
+struct InferenceEngine::OrtPack
+{
+    Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "MedYOLO11Qt"};
+    Ort::SessionOptions opts;
+    std::unique_ptr<Ort::Session> session;
+    std::vector<Ort::AllocatedStringPtr> inPtrs;
+    std::vector<Ort::AllocatedStringPtr> outPtrs;
+    std::vector<const char *> inputNames;
+    std::vector<const char *> outputNames;
+};
+#endif
+
+InferenceEngine::InferenceEngine() = default;
+InferenceEngine::~InferenceEngine() = default;
+
+bool InferenceEngine::loadModel(const QString &path)
+{
+#ifndef HAVE_ORT
+    Q_UNUSED(path);
+    LOG_WARNING(QStringLiteral("编译时未启用 ONNXRuntime，无法加载模型"), "Inference", 5005);
+    return false;
+#else
+    try
+    {
+        if (path.isEmpty())
         {
-            if (path.isEmpty())
-        {
-            LOG_WARNING("模型路径为空", "Inference", 5006);
-            return false;
-        }
-
-        if (m_ort && m_ort->session && !m_modelPath.isEmpty())
-        {
-            QFileInfo current(m_modelPath);
-            QFileInfo requested(path);
-            if (current == requested)
-            {
-                LOG_INFO("模型已加载且路径未变化，跳过重复初始化", "Inference");
-                return true;
-            }
-        }
-
-        AppConfig &config = AppConfig::instance();
-        QString keyStr = config.getModelProtectionKey();
-        if (keyStr.isEmpty())
-        {
-            keyStr = "MedYOLO11Qt_Model_Protection_Key_2024";
-            LOG_WARNING("配置中未找到模型保护密钥，使用默认密钥", "Inference", 5010);
-        }
-
-        QByteArray key = QCryptographicHash::hash(keyStr.toUtf8(), QCryptographicHash::Sha256);
-        QString loadError;
-        auto loadInfo = EncryptedModelLoader::load(path, key, &loadError);
-        if (!loadInfo.has_value())
-        {
-            QString msg = loadError.isEmpty() ? QString("模型加载失败: %1").arg(path) : loadError;
-            LOG_ERROR(msg, "Inference", 5007);
-            return false;
-        }
-        QByteArray modelData = loadInfo->data;
-
+            LOG_WARNING(QStringLiteral("模型路径为空"), "Inference", 5006);
+            return false;
+        }
+
+        if (m_ort && m_ort->session && !m_modelPath.isEmpty())
+        {
+            if (QFileInfo(m_modelPath) == QFileInfo(path))
+            {
+                LOG_INFO(QStringLiteral("模型已加载且路径未变化，跳过重复初始化"), "Inference");
+                return true;
+            }
+        }
+
+        AppConfig &config = AppConfig::instance();
+        QString keyStr = config.getModelProtectionKey();
+        if (keyStr.isEmpty())
+        {
+            keyStr = QStringLiteral("MedYOLO11Qt_Model_Protection_Key_2024");
+            LOG_WARNING(QStringLiteral("配置中未找到模型保护密钥，使用默认密钥"), "Inference", 5010);
+        }
+
+        const QByteArray key = QCryptographicHash::hash(keyStr.toUtf8(), QCryptographicHash::Sha256);
+
+        QString loadError;
+        auto loadInfo = EncryptedModelLoader::load(path, key, &loadError);
+        if (!loadInfo.has_value())
+        {
+            const QString msg = loadError.isEmpty()
+                                    ? QStringLiteral("模型加载失败: %1").arg(path)
+                                    : loadError;
+            LOG_ERROR(msg, "Inference", 5007);
+            return false;
+        }
+
+        const QByteArray modelData = loadInfo->data;
 
         m_ort = std::make_unique<OrtPack>();
         m_ort->opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
-        // 设置ONNX Runtime环境变量
-        OrtLoggingLevel logLevel = ORT_LOGGING_LEVEL_WARNING;
-        if (config.isDebugModeEnabled())
-        {
-            logLevel = ORT_LOGGING_LEVEL_INFO;
-        }
+        const OrtLoggingLevel logLevel = config.isDebugModeEnabled() ? ORT_LOGGING_LEVEL_INFO : ORT_LOGGING_LEVEL_WARNING;
         m_ort->env = Ort::Env(logLevel, "MedYOLO11Qt");
 
-        // 使用内存中的模型数据创建session
         m_ort->session = std::make_unique<Ort::Session>(
             m_ort->env,
             modelData.constData(),
-            modelData.size(),
+            static_cast<size_t>(modelData.size()),
             m_ort->opts);
 
         Ort::AllocatorWithDefaultOptions alloc;
-        size_t ni = m_ort->session->GetInputCount(), no = m_ort->session->GetOutputCount();
+        const size_t ni = m_ort->session->GetInputCount();
+        const size_t no = m_ort->session->GetOutputCount();
+        m_ort->inPtrs.clear();
+        m_ort->outPtrs.clear();
+        m_ort->inputNames.clear();
+        m_ort->outputNames.clear();
         m_ort->inPtrs.reserve(ni);
         m_ort->outPtrs.reserve(no);
         m_ort->inputNames.reserve(ni);
@@ -394,49 +435,52 @@ namespace
             m_ort->outputNames.push_back(m_ort->outPtrs.back().get());
         }
 
-        // 输入尺寸
         try
         {
             auto ti = m_ort->session->GetInputTypeInfo(0);
             if (ti.GetONNXType() == ONNX_TYPE_TENSOR)
             {
                 auto inf = ti.GetTensorTypeAndShapeInfo();
-                auto sh = inf.GetShape(); // [1,3,H,W]
-                if (sh.size() >= 4 && sh[2] > 0 && sh[3] > 0)
+                auto sh = inf.GetShape();
+                if (sh.size() >= 4 && std::abs(static_cast<int>(sh[2])) > 0 && std::abs(static_cast<int>(sh[3])) > 0)
                 {
-                    m_inH = (int)sh[2];
-                    m_inW = (int)sh[3];
+                    m_inH = std::abs(static_cast<int>(sh[2]));
+                    m_inW = std::abs(static_cast<int>(sh[3]));
                 }
             }
         }
         catch (...)
         {
-            LOG_WARNING("无法获取模型输入尺寸，使用默认值 640x640", "Inference", 5014);
             m_inH = m_inW = 640;
         }
 
-        // 输出结构判定：挑一个 rank=3 的 float 输出
         m_isYoloDetect = false;
         m_hasObj = false;
         m_numClasses = 0;
         m_channels = 0;
+        m_detOutputIndex = -1;
+        m_segOutputIndex = -1;
+
         for (size_t i = 0; i < no; ++i)
         {
             auto to = m_ort->session->GetOutputTypeInfo(i);
             if (to.GetONNXType() != ONNX_TYPE_TENSOR)
                 continue;
-            auto inf = to.GetTensorTypeAndShapeInfo();
-            if (inf.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+            auto info = to.GetTensorTypeAndShapeInfo();
+            if (info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
                 continue;
-            auto sh = inf.GetShape(); // [1,C,N] 或 [1,N,C]
+            auto sh = info.GetShape();
             if (sh.size() == 3)
             {
-                int d1 = std::abs((int)sh[1]), d2 = std::abs((int)sh[2]);
-                int C = std::min(d1, d2), N = std::max(d1, d2);
+                const int d1 = std::abs(static_cast<int>(sh[1]));
+                const int d2 = std::abs(static_cast<int>(sh[2]));
+                const int C = std::min(d1, d2);
+                const int N = std::max(d1, d2);
                 if (C >= 6 && N >= 10)
                 {
                     m_isYoloDetect = true;
-                    int nc_v8 = C - 4, nc_v5 = C - 5;
+                    const int nc_v8 = C - 4;
+                    const int nc_v5 = C - 5;
                     if (nc_v8 >= 1)
                     {
                         m_hasObj = false;
@@ -454,24 +498,24 @@ namespace
         }
 
         m_modelPath = path;
-        LOG_INFO(QString("成功加载模型: %1, 输入尺寸: %2x%3").arg(path).arg(m_inW).arg(m_inH), "Inference");
+        LOG_INFO(QStringLiteral("成功加载模型: %1, 输入尺寸: %2x%3").arg(path).arg(m_inW).arg(m_inH), "Inference");
         return true;
     }
     catch (const Ort::Exception &e)
     {
-        LOG_ERROR(QString("ONNX Runtime 异常: %1").arg(e.what()), "Inference", 5012);
+        LOG_ERROR(QStringLiteral("ONNX Runtime 异常: %1").arg(QString::fromUtf8(e.what())), "Inference", 5012);
         m_ort.reset();
         return false;
     }
     catch (const std::exception &e)
     {
-        LOG_ERROR(QString("模型加载异常: %1").arg(e.what()), "Inference", 5013);
+        LOG_ERROR(QStringLiteral("模型加载异常: %1").arg(QString::fromUtf8(e.what())), "Inference", 5013);
         m_ort.reset();
         return false;
     }
     catch (...)
     {
-        LOG_ERROR("模型加载发生未知异常", "Inference", 5014);
+        LOG_ERROR(QStringLiteral("模型加载发生未知异常"), "Inference", 5014);
         m_ort.reset();
         return false;
     }
@@ -892,4 +936,3 @@ QColor InferenceEngine::classColor(int cls)
     static const QColor colors[] = {QColor(255, 0, 0), QColor(0, 255, 0), QColor(0, 0, 255), QColor(128, 128, 128)};
     return (cls >= 0 && cls < 4) ? colors[cls] : QColor(128, 128, 128);
 }
-

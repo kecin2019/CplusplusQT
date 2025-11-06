@@ -30,8 +30,8 @@ AppConfig::AppConfig()
     if (!QFile::exists(m_configFilePath))
     {
         // 设置默认值
-        setFaiModelPath("./models/fai_xray.onnx");
-        setMriModelPath("./models/mri_segmentation.onnx");
+        setFaiModelPath("./models/encrypted/fai_xray.encrypted");
+        setMriModelPath("./models/encrypted/mri_segmentation.encrypted");
         setConfidenceThreshold(0.25f);
         setIoUThreshold(0.45f);
         setModelProtectionKey("MedYOLO11Qt_Model_Protection_Key_2024");

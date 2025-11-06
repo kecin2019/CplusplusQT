@@ -9,8 +9,8 @@
 #include <QFileDialog>
 #include <QTabWidget>
 #include <QPlainTextEdit>
-#include <QSplitter>
 #include <QVBoxLayout>
+#include <QHBoxLayout>
 #include <QStatusBar>
 #include <QAction>
 #include <QMessageBox>
@@ -19,16 +19,22 @@
 #include <QListWidget>
 #include <QDirIterator>
 #include <QFileInfo>
+#include <QWidget>
 #include <QJsonDocument>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QFile>
+#include <QDateTime>
+#include <QProgressBar>
 #include <qapplication.h>
 #include <QTimer>
 #include <QStringList>
 #include <QProgressDialog>
 #include <QPointer>
 #include <QtConcurrent>
+#include <QCoreApplication>
+#include <QPalette>
+#include <QStyleFactory>
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
 {
@@ -61,180 +67,216 @@ MainWindow::~MainWindow()
 
 void MainWindow::setTaskType(TaskSelectionDialog::TaskType taskType)
 {
-    // 根据任务类型隐藏/显示相应的UI元素
-    if (taskType == TaskSelectionDialog::MRI_Segmentation)
-    {
-        // MRI分割模式：显示MRI加载按钮，隐藏X光加载按钮
-        if (m_actLoadMRI)
-            m_actLoadMRI->setVisible(true);
-        if (m_actLoadFAI)
-            m_actLoadFAI->setVisible(false);
-    }
-    else
-    {
-        // X光检测模式：显示X光加载按钮，隐藏MRI加载按钮
-        if (m_actLoadFAI)
-            m_actLoadFAI->setVisible(true);
-        if (m_actLoadMRI)
-            m_actLoadMRI->setVisible(false);
-    }
+    m_currentTask = taskType;
+    updateTaskUi(taskType);
     refreshActionStates();
 }
+
 void MainWindow::setupUi()
 {
-    auto *tb = addToolBar("Main");
-    auto *actOpenImg = tb->addAction("Open Image");
-    auto *actOpenDicom = tb->addAction("Open DICOM");
-    auto *actOpenFolder = tb->addAction("Open Folder");
+    applyPalette();
+    applyStyleSheet(":/styles/modern_light.qss");
+    createToolBar();
+    createCentralViews();
+    createDockWidgets();
+    createStatusBar();
 
-    tb->addSeparator();
+    updateTaskUi(m_currentTask);
+    refreshActionStates();
+}
 
-    m_actLoadFAI = tb->addAction("Load FAI ONNX");
-    m_actLoadFAI->setVisible(false); // 初始隐藏
-    m_actRun = tb->addAction("Run Inference");
+void MainWindow::createToolBar()
+{
+    auto *tb = addToolBar(tr("Main"));
+    tb->setObjectName("MainToolbar");
+    tb->setMovable(false);
 
-    tb->addSeparator();
-
-    auto *actClear = tb->addAction("Clear");
+    auto *actOpenImg = tb->addAction(tr("Open Image"));
+    auto *actOpenDicom = tb->addAction(tr("Open DICOM"));
+    auto *actOpenFolder = tb->addAction(tr("Open Folder"));
 
     connect(actOpenImg, &QAction::triggered, this, &MainWindow::openImage);
     connect(actOpenDicom, &QAction::triggered, this, &MainWindow::openDicom);
     connect(actOpenFolder, &QAction::triggered, this, &MainWindow::openFolder);
+
+    tb->addSeparator();
+
+    m_actLoadFAI = tb->addAction(tr("Load FAI Model"));
     connect(m_actLoadFAI, &QAction::triggered, this, &MainWindow::loadFAIModel);
+
+    m_actLoadMRI = tb->addAction(tr("Load MRI Model"));
+    connect(m_actLoadMRI, &QAction::triggered, this, &MainWindow::loadMRIModel);
+
+    tb->addSeparator();
+
+    m_actRun = tb->addAction(tr("Run Inference"));
     connect(m_actRun, &QAction::triggered, this, &MainWindow::runInference);
-    connect(actClear, &QAction::triggered, this, &MainWindow::clearAll);
 
-    // ---- 中心区域：左图右信息 ----
-    m_splitter = new QSplitter(this);
-    m_viewTabs = new QTabWidget(this);
-    m_inputView = new ImageView(this);
-    m_outputView = new ImageView(this);
-    m_viewTabs->addTab(m_inputView, "Input");
-    m_viewTabs->addTab(m_outputView, "Output");
-
-    // 右侧：上下分割（上=Metadata，下=文件列表）
-    QSplitter *rightSplit = new QSplitter(Qt::Vertical, this);
-
-    // --- 上：Metadata 面板 ---
-    auto *metaPanel = new QWidget(this);
-    auto *metaLayout = new QVBoxLayout(metaPanel);
-    metaLayout->setContentsMargins(12, 12, 12, 12);
-    metaLayout->setSpacing(8);
-    auto *metaLabel = new QLabel("Metadata (DICOM tags or file info)", this);
-    m_meta = new MetaTable(this);
-    metaLayout->addWidget(metaLabel);
-    metaLayout->addWidget(m_meta, 1);
-    rightSplit->addWidget(metaPanel);
-
-    // --- 下：Batch Files（从左侧 Dock 移到这里） ---
-    auto *filesPanel = new QWidget(this);
-    auto *filesLayout = new QVBoxLayout(filesPanel);
-    filesLayout->setContentsMargins(12, 8, 12, 12);
-    filesLayout->setSpacing(8);
-
-    auto *filesHeader = new QHBoxLayout();
-    auto *filesTitle = new QLabel("Batch Files", this);
-    auto *filterEdit = new QLineEdit(this);
-    filterEdit->setPlaceholderText("Filter...");
-    filesHeader->addWidget(filesTitle);
-    filesHeader->addStretch();
-    filesHeader->addWidget(filterEdit);
-
-    m_list = new QListWidget(this);
-    filesLayout->addLayout(filesHeader);
-    filesLayout->addWidget(m_list, 1);
-    rightSplit->addWidget(filesPanel);
-
-    // 简单的文件名过滤
-    connect(filterEdit, &QLineEdit::textChanged, this, [this](const QString &s)
-            {
-    for (int i = 0; i < m_list->count(); ++i) { 
-        auto *it = m_list->item(i);
-        it->setHidden(!it->text().contains(s, Qt::CaseInsensitive));
-    } });
-    // 保持原有选择回调
-    connect(m_list, &QListWidget::itemSelectionChanged, this, &MainWindow::onListActivated);
-
-    // 拼到主分割器
-    m_splitter->addWidget(m_viewTabs);
-    m_splitter->addWidget(rightSplit);
-
-    // 让图片更大
-    // 让左侧图像区域更大
-    m_splitter->setStretchFactor(0, 7); // 左侧
-    m_splitter->setStretchFactor(1, 3); // 右侧
-
-    // 初始显示时就给出更大的左侧宽度（需在窗口显示后设置）
-    QTimer::singleShot(0, this, [this]()
-                       {
-        const int w = this->width();
-        m_splitter->setSizes({ int(w*0.75), int(w*0.25) }); });
-
-    rightSplit->setStretchFactor(0, 2); // 上面板权重大些（Metadata）
-    rightSplit->setStretchFactor(1, 1); // 下面板（文件列表）
-
-    setCentralWidget(m_splitter);
-    statusBar()->showMessage("Ready");
-
-    m_actExport = tb->addAction("Export Result");
-    m_actExportAll = tb->addAction("Batch Export");
-
-    connect(m_actExport, &QAction::triggered, this, &MainWindow::exportCurrent);
-    connect(m_actExportAll, &QAction::triggered, this, &MainWindow::exportBatch);
-
-    m_actBatch = tb->addAction("Batch Infer");
+    m_actBatch = tb->addAction(tr("Batch Infer"));
     connect(m_actBatch, &QAction::triggered, this, &MainWindow::runBatchInference);
 
-    // 添加MRI分割功能（初始隐藏，根据任务类型显示）
     tb->addSeparator();
-    m_actLoadMRI = tb->addAction("Load MRI Model");
-    connect(m_actLoadMRI, &QAction::triggered, this, &MainWindow::loadMRIModel);
-    m_actLoadMRI->setVisible(false); // 初始隐藏
 
-    // 添加任务切换按钮
+    m_actExport = tb->addAction(tr("Export Result"));
+    connect(m_actExport, &QAction::triggered, this, &MainWindow::exportCurrent);
+
+    m_actExportAll = tb->addAction(tr("Batch Export"));
+    connect(m_actExportAll, &QAction::triggered, this, &MainWindow::exportBatch);
+
     tb->addSeparator();
-    auto *actSwitchTask = tb->addAction("Switch Task");
+
+    auto *actClear = tb->addAction(tr("Clear"));
+    connect(actClear, &QAction::triggered, this, &MainWindow::clearAll);
+
+    tb->addSeparator();
+
+    auto *actSwitchTask = tb->addAction(tr("Switch Task"));
     connect(actSwitchTask, &QAction::triggered, this, &MainWindow::switchTask);
 
-    // 初始：未加载模型时禁用推理/导出/批处理
-    for (QAction *a : {m_actRun, m_actBatch, m_actExport, m_actExportAll})
-        if (a)
-            a->setEnabled(false);
+    tb->addSeparator();
 
-    // 亮色 Fusion
-    qApp->setStyle("Fusion");
-    QPalette pal = qApp->palette(); // Fusion 默认就是亮色，这里只微调
-    pal.setColor(QPalette::Highlight, QColor(52, 120, 246));
-    pal.setColor(QPalette::HighlightedText, Qt::white);
-    qApp->setPalette(pal);
-
-    // 轻量 QSS：圆角 + 浅边框 + 明亮背景
-    setStyleSheet(R"(
-QMainWindow { background:#F7F8FA; }
-QToolBar { background:#F7F8FA; border:none; padding:6px; spacing:8px; }
-
-QToolButton { border-radius:10px; padding:6px 10px; }
-QToolButton:hover { background:#EBEEF2; }
-
-QTabWidget::pane { border:1px solid #E4E7EC; border-radius:12px; padding:6px; background:#FFFFFF; }
-QTabBar::tab {
-  background:#FFFFFF; border:1px solid #E4E7EC; border-bottom:none;
-  padding:6px 12px; margin-right:4px; border-top-left-radius:10px; border-top-right-radius:10px;
-}
-QTabBar::tab:selected { background:#F2F4F7; }
-
-QListWidget, QTableWidget, QLineEdit, QPlainTextEdit {
-  background:#FFFFFF; border:1px solid #E4E7EC; border-radius:12px; padding:8px;
-}
-QHeaderView::section {
-  background:#F7F8FA; border:1px solid #E4E7EC; padding:6px; border-radius:8px;
+    m_actToggleLog = tb->addAction(tr("Show Log"));
+    m_actToggleLog->setCheckable(true);
+    connect(m_actToggleLog, &QAction::toggled, this, &MainWindow::toggleLogDock);
 }
 
-QStatusBar { background:#F7F8FA; border-top:1px solid #E4E7EC; }
-)");
-
-    refreshActionStates();
+void MainWindow::createCentralViews()
+{
+    m_viewTabs = new QTabWidget(this);
+    m_viewTabs->setObjectName("ImageTabs");
+    m_inputView = new ImageView(this);
+    m_outputView = new ImageView(this);
+    m_viewTabs->addTab(m_inputView, tr("Input"));
+    m_viewTabs->addTab(m_outputView, tr("Output"));
+    setCentralWidget(m_viewTabs);
 }
+
+void MainWindow::createDockWidgets()
+{
+    // Metadata dock
+    m_metadataDock = new QDockWidget(tr("Metadata"), this);
+    m_metadataDock->setObjectName("MetadataDock");
+    m_metadataDock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
+    auto *metaContainer = new QWidget(m_metadataDock);
+    auto *metaLayout = new QVBoxLayout(metaContainer);
+    metaLayout->setContentsMargins(12, 12, 12, 12);
+    metaLayout->setSpacing(8);
+    auto *metaLabel = new QLabel(tr("Metadata (DICOM tags or file info)"), metaContainer);
+    m_meta = new MetaTable(metaContainer);
+    metaLayout->addWidget(metaLabel);
+    metaLayout->addWidget(m_meta, 1);
+    metaContainer->setLayout(metaLayout);
+    m_metadataDock->setWidget(metaContainer);
+    addDockWidget(Qt::RightDockWidgetArea, m_metadataDock);
+
+    // Batch dock
+    m_batchDock = new QDockWidget(tr("Batch Files"), this);
+    m_batchDock->setObjectName("BatchDock");
+    m_batchDock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
+    auto *batchContainer = new QWidget(m_batchDock);
+    auto *batchLayout = new QVBoxLayout(batchContainer);
+    batchLayout->setContentsMargins(12, 8, 12, 12);
+    batchLayout->setSpacing(8);
+
+    auto *headerLayout = new QHBoxLayout();
+    auto *filesTitle = new QLabel(tr("Batch Files"), batchContainer);
+    m_batchFilter = new QLineEdit(batchContainer);
+    m_batchFilter->setPlaceholderText(tr("Filter..."));
+    headerLayout->addWidget(filesTitle);
+    headerLayout->addStretch();
+    headerLayout->addWidget(m_batchFilter);
+
+    m_list = new QListWidget(batchContainer);
+    batchLayout->addLayout(headerLayout);
+    batchLayout->addWidget(m_list, 1);
+    batchContainer->setLayout(batchLayout);
+    m_batchDock->setWidget(batchContainer);
+    addDockWidget(Qt::RightDockWidgetArea, m_batchDock);
+    tabifyDockWidget(m_metadataDock, m_batchDock);
+    m_metadataDock->raise();
+
+    connect(m_batchFilter, &QLineEdit::textChanged, this, [this](const QString &text)
+            {
+        if (!m_list)
+            return;
+        for (int i = 0; i < m_list->count(); ++i)
+        {
+            auto *item = m_list->item(i);
+            item->setHidden(!item->text().contains(text, Qt::CaseInsensitive));
+        } });
+    connect(m_list, &QListWidget::itemSelectionChanged, this, &MainWindow::onListActivated);
+
+    // Log dock
+    m_logDock = new QDockWidget(tr("Runtime Log"), this);
+    m_logDock->setObjectName("LogDock");
+    m_logDock->setAllowedAreas(Qt::BottomDockWidgetArea | Qt::TopDockWidgetArea);
+    m_logView = new QPlainTextEdit(m_logDock);
+    m_logView->setReadOnly(true);
+    m_logDock->setWidget(m_logView);
+    addDockWidget(Qt::BottomDockWidgetArea, m_logDock);
+    m_logDock->hide();
+    if (m_actToggleLog)
+        m_actToggleLog->setChecked(false);
+
+    connect(m_logDock, &QDockWidget::visibilityChanged, this, [this](bool visible)
+            {
+        if (m_actToggleLog && m_actToggleLog->isChecked() != visible)
+            m_actToggleLog->setChecked(visible); });
+}
+
+void MainWindow::createStatusBar()
+{
+    statusBar()->setContentsMargins(8, 0, 8, 0);
+    m_statusMode = new QLabel(tr("Mode: --"), this);
+    m_statusModel = new QLabel(tr("Model: --"), this);
+    m_statusProgress = new QProgressBar(this);
+    m_statusProgress->setFixedWidth(140);
+    m_statusProgress->setTextVisible(false);
+    m_statusProgress->setVisible(false);
+
+    statusBar()->addPermanentWidget(m_statusMode);
+    statusBar()->addPermanentWidget(m_statusModel);
+    statusBar()->addPermanentWidget(m_statusProgress);
+    statusBar()->showMessage(tr("Ready"));
+}
+
+void MainWindow::applyPalette()
+{
+    QApplication::setStyle(QStyleFactory::create("Fusion"));
+
+    QPalette palette;
+    palette.setColor(QPalette::Window, QColor("#f4f6fb"));
+    palette.setColor(QPalette::WindowText, QColor("#1b1f29"));
+    palette.setColor(QPalette::Base, QColor("#ffffff"));
+    palette.setColor(QPalette::AlternateBase, QColor("#edf1fc"));
+    palette.setColor(QPalette::ToolTipBase, QColor("#ffffff"));
+    palette.setColor(QPalette::ToolTipText, QColor("#1b1f29"));
+    palette.setColor(QPalette::Text, QColor("#1b1f29"));
+    palette.setColor(QPalette::Button, QColor("#ffffff"));
+    palette.setColor(QPalette::ButtonText, QColor("#1b1f29"));
+    palette.setColor(QPalette::Highlight, QColor("#3b82f6"));
+    palette.setColor(QPalette::HighlightedText, QColor("#ffffff"));
+    palette.setColor(QPalette::Link, QColor("#2563eb"));
+    palette.setColor(QPalette::BrightText, QColor("#ffffff"));
+    palette.setColor(QPalette::Midlight, QColor("#e2e8f0"));
+    palette.setColor(QPalette::Dark, QColor("#cbd5e1"));
+    palette.setColor(QPalette::Shadow, QColor("#94a3b8"));
+
+    qApp->setPalette(palette);
+}
+
+void MainWindow::applyStyleSheet(const QString &resourcePath)
+{
+    QFile styleFile(resourcePath);
+    if (!styleFile.open(QIODevice::ReadOnly | QIODevice::Text))
+    {
+        LOG_WARNING(QStringLiteral("Unable to load stylesheet: %1").arg(resourcePath), "UI", 1101);
+        return;
+    }
+    const QString style = QString::fromUtf8(styleFile.readAll());
+    qApp->setStyleSheet(style);
+}
+
 void MainWindow::openImage()
 {
     QString f = QFileDialog::getOpenFileName(this, "Open Image", QString(),
@@ -333,11 +375,11 @@ void MainWindow::runInference()
     const QImage inputCopy = m_input;
     const InferenceEngine::Task task = m_pendingTask;
 
-    auto future = QtConcurrent::run([this, inputCopy, task]() {
+    auto future = QtConcurrent::run([this, inputCopy, task]()
+                                    {
         if (task == InferenceEngine::Task::HipMRI_Seg)
             return m_mriEngine.run(inputCopy, task);
-        return m_engine.run(inputCopy, task);
-    });
+        return m_engine.run(inputCopy, task); });
     m_singleWatcher.setFuture(future);
 }
 
@@ -373,7 +415,8 @@ void MainWindow::runBatchInference()
     const InferenceEngine::Task task = m_modelReady ? InferenceEngine::Task::FAI_XRay : InferenceEngine::Task::HipMRI_Seg;
     QPointer<MainWindow> guard(this);
 
-    auto future = QtConcurrent::run([this, guard, task, paths = std::move(paths)]() -> std::vector<BatchItem> {
+    auto future = QtConcurrent::run([this, guard, task, paths = std::move(paths)]() -> std::vector<BatchItem>
+                                    {
         std::vector<BatchItem> results;
         results.reserve(static_cast<size_t>(paths.size()));
         int index = 0;
@@ -394,13 +437,13 @@ void MainWindow::runBatchInference()
             }
             else if (isDicomFile(path))
             {
-    #ifdef HAVE_GDCM
+#ifdef HAVE_GDCM
                 ok = DicomUtils::loadDicomToQImage(path, image, nullptr);
                 if (!ok)
                     error = QStringLiteral("Failed to load DICOM: %1").arg(path);
-    #else
+#else
                 error = QStringLiteral("Built without GDCM support");
-    #endif
+#endif
             }
             else
             {
@@ -426,12 +469,11 @@ void MainWindow::runBatchInference()
             {
                 QMetaObject::invokeMethod(guard, [guard, index, totalCount]() {
                     if (guard)
-                        guard->updateProgressValue(index, totalCount);
+guard->updateProgressValue(index, totalCount);
                 }, Qt::QueuedConnection);
             }
         }
-        return results;
-    });
+        return results; });
 
     m_batchWatcher.setFuture(future);
 }
@@ -449,6 +491,53 @@ void MainWindow::refreshActionStates()
         m_actExportAll->setEnabled(hasModel && !busy);
     if (m_actExport)
         m_actExport->setEnabled(!m_output.isNull() && !busy);
+
+    updateStatusSummary();
+}
+
+void MainWindow::toggleLogDock(bool checked)
+{
+    if (!m_logDock)
+        return;
+    m_logDock->setVisible(checked);
+}
+
+void MainWindow::updateTaskUi(TaskSelectionDialog::TaskType taskType)
+{
+    const bool isSegmentation = (taskType == TaskSelectionDialog::MRI_Segmentation);
+    if (m_actLoadFAI)
+        m_actLoadFAI->setVisible(!isSegmentation);
+    if (m_actLoadMRI)
+        m_actLoadMRI->setVisible(isSegmentation);
+    if (m_batchDock)
+    {
+        const QString title = isSegmentation ? tr("Batch Files (Segmentation)") : tr("Batch Files");
+        m_batchDock->setWindowTitle(title);
+    }
+    setWindowTitle(isSegmentation ? tr("Med YOLO11 Qt - MRI Segmentation")
+                                  : tr("Med YOLO11 Qt - FAI X-Ray Detection"));
+    updateStatusSummary();
+}
+
+void MainWindow::updateStatusSummary()
+{
+    if (m_statusMode)
+    {
+        const QString modeText = (m_currentTask == TaskSelectionDialog::MRI_Segmentation)
+                                     ? tr("Mode: MRI Segmentation")
+                                     : tr("Mode: FAI X-Ray");
+        m_statusMode->setText(modeText);
+    }
+
+    if (m_statusModel)
+    {
+        QString info;
+        if (m_currentTask == TaskSelectionDialog::MRI_Segmentation)
+            info = m_mriModelReady ? tr("MRI Model: Ready") : tr("MRI Model: Not loaded");
+        else
+            info = m_modelReady ? tr("FAI Model: Ready") : tr("FAI Model: Not loaded");
+        m_statusModel->setText(info);
+    }
 }
 
 void MainWindow::setBusyState(bool busy, const QString &message, int maximum)
@@ -476,10 +565,32 @@ void MainWindow::setBusyState(bool busy, const QString &message, int maximum)
         }
         m_progressDialog->show();
         statusBar()->showMessage(message);
+
+        if (m_statusProgress)
+        {
+            if (maximum > 0)
+            {
+                m_statusProgress->setRange(0, maximum);
+                m_statusProgress->setValue(0);
+            }
+            else
+            {
+                m_statusProgress->setRange(0, 0);
+            }
+            m_statusProgress->setVisible(true);
+        }
     }
     else if (m_progressDialog)
     {
         m_progressDialog->hide();
+        m_progressDialog->reset();
+        statusBar()->showMessage(tr("Ready"), 2000);
+        if (m_statusProgress)
+        {
+            m_statusProgress->setVisible(false);
+            m_statusProgress->setRange(0, 1);
+            m_statusProgress->setValue(0);
+        }
     }
 
     if (m_list)
@@ -490,6 +601,20 @@ void MainWindow::setBusyState(bool busy, const QString &message, int maximum)
         m_actLoadMRI->setEnabled(!busy);
 
     refreshActionStates();
+}
+
+bool MainWindow::promptForModelFile(QString &path, const QString &title) const
+{
+    const QString startDir = path.isEmpty() ? QCoreApplication::applicationDirPath()
+                                            : QFileInfo(path).absolutePath();
+    const QString selected = QFileDialog::getOpenFileName(const_cast<MainWindow *>(this),
+                                                          title,
+                                                          startDir,
+                                                          tr("Model Files (*.onnx *.encrypted);;ONNX Models (*.onnx);;Encrypted Models (*.encrypted)"));
+    if (selected.isEmpty())
+        return false;
+    path = selected;
+    return true;
 }
 
 void MainWindow::updateProgressValue(int value, int maximum)
@@ -505,6 +630,25 @@ void MainWindow::updateProgressValue(int value, int maximum)
     else
     {
         m_progressDialog->setRange(0, 0);
+    }
+
+    statusBar()->showMessage(
+        maximum > 0
+            ? tr("Progress: %1 / %2").arg(value).arg(maximum)
+            : tr("Processing..."));
+
+    if (m_statusProgress)
+    {
+        if (maximum > 0)
+        {
+            m_statusProgress->setRange(0, maximum);
+            m_statusProgress->setValue(value);
+        }
+        else
+        {
+            m_statusProgress->setRange(0, 0);
+        }
+        m_statusProgress->setVisible(true);
     }
 }
 
@@ -589,95 +733,130 @@ void MainWindow::handleBatchInferenceFinished()
 
 void MainWindow::loadFAIModel()
 {
-    // 使用配置文件中的模型路径
     QString modelPath = AppConfig::instance().getFaiModelPath();
-
-    // 如果配置中的路径不存在或无效，让用户选择文件
     if (!QFileInfo::exists(modelPath))
     {
-        QString userSelectedPath = QFileDialog::getOpenFileName(this, "Select FAI ONNX Model",
-                                                                QCoreApplication::applicationDirPath(),
-                                                                "ONNX Models (*.onnx)");
-
-        if (userSelectedPath.isEmpty())
+        log(tr("配置的FAI模型文件不存在，尝试使用默认路径"));
+        // 检查默认路径
+        QString defaultPath = QCoreApplication::applicationDirPath() + "/models/encrypted/fai_xray.encrypted";
+        if (QFileInfo::exists(defaultPath))
         {
-            LOG_WARNING("FAI model selection canceled", "Model", 2001);
-            return;
+            modelPath = defaultPath;
         }
-
-        modelPath = userSelectedPath;
-        // 保存用户选择的路径到配置
-        AppConfig::instance().setFaiModelPath(modelPath);
-        AppConfig::instance().saveConfig();
+        else
+        {
+            if (!promptForModelFile(modelPath, tr("Select FAI ONNX Model")))
+            {
+                LOG_WARNING("FAI model selection canceled", "Model", 2001);
+                return;
+            }
+        }
     }
 
     try
     {
-        m_faiOnnxPath = modelPath;
-        m_modelReady = m_engine.loadModel(m_faiOnnxPath);
-        if (!m_modelReady)
+        bool keepPrompting = true;
+        while (keepPrompting)
         {
-            QString errorMsg = "Failed to load ONNX model.";
-            LOG_ERROR(errorMsg, "Model", 2002);
-            QMessageBox::warning(this, "Load Model", errorMsg);
-            return;
+            m_faiOnnxPath = modelPath;
+            log(tr("正在加载FAI模型: %1").arg(modelPath));
+            m_modelReady = m_engine.loadModel(m_faiOnnxPath);
+            if (m_modelReady)
+            {
+                keepPrompting = false;
+            }
+            else
+            {
+                const auto choice = QMessageBox::warning(this,
+                                                         tr("Load FAI Model"),
+                                                         tr("Failed to load the selected FAI model.\n\nPossible reasons:\n"
+                                                            "1. The model file is not encrypted\n"
+                                                            "2. The encryption key is incorrect\n"
+                                                            "3. The model file is corrupted\n\n"
+                                                            "Would you like to choose another file?"),
+                                                         QMessageBox::Retry | QMessageBox::Cancel);
+                if (choice == QMessageBox::Retry)
+                {
+                    if (!promptForModelFile(modelPath, tr("Select FAI ONNX Model")))
+                    {
+                        LOG_WARNING("FAI model selection canceled after failure", "Model", 2002);
+                        return;
+                    }
+                    continue;
+                }
+                LOG_WARNING("User canceled FAI model loading after failure", "Model", 2003);
+                return;
+            }
         }
+
+        AppConfig::instance().setFaiModelPath(modelPath);
+        AppConfig::instance().saveConfig();
         refreshActionStates();
 
-        log(QString("FAI ONNX loaded: %1").arg(modelPath));
+        log(tr("FAI model loaded: %1").arg(modelPath));
     }
     catch (const std::exception &e)
     {
-        QString errorMsg = QString("Failed to load FAI model: %1").arg(e.what());
-        LOG_ERROR(errorMsg, "Model", 2003);
-        QMessageBox::critical(this, "Model Loading Error", errorMsg);
+        const QString errorMsg = tr("Failed to load FAI model: %1").arg(e.what());
+        LOG_ERROR(errorMsg, "Model", 2004);
+        QMessageBox::critical(this, tr("Model Loading Error"), errorMsg);
     }
 }
 
 void MainWindow::loadMRIModel()
 {
-    // 使用配置文件中的模型路径
     QString modelPath = AppConfig::instance().getMriModelPath();
-
-    // 如果配置中的路径不存在或无效，让用户选择文件
     if (!QFileInfo::exists(modelPath))
     {
-        QString userSelectedPath = QFileDialog::getOpenFileName(this, "Select MRI Segmentation Model",
-                                                                QCoreApplication::applicationDirPath(),
-                                                                "ONNX Models (*.onnx)");
-
-        if (userSelectedPath.isEmpty())
+        if (!promptForModelFile(modelPath, tr("Select MRI Segmentation Model")))
         {
             LOG_WARNING("MRI model selection canceled", "Model", 2004);
             return;
         }
-
-        modelPath = userSelectedPath;
-        // 保存用户选择的路径到配置
-        AppConfig::instance().setMriModelPath(modelPath);
-        AppConfig::instance().saveConfig();
     }
 
     try
     {
-        m_mriOnnxPath = modelPath;
-        m_mriModelReady = m_mriEngine.loadModel(m_mriOnnxPath);
-        if (!m_mriModelReady)
+        bool keepPrompting = true;
+        while (keepPrompting)
         {
-            QString errorMsg = "Failed to load MRI ONNX model.";
-            LOG_ERROR(errorMsg, "Model", 2005);
-            QMessageBox::warning(this, "Load MRI Model", errorMsg);
-            return;
+            m_mriOnnxPath = modelPath;
+            m_mriModelReady = m_mriEngine.loadModel(m_mriOnnxPath);
+            if (m_mriModelReady)
+            {
+                keepPrompting = false;
+            }
+            else
+            {
+                const auto choice = QMessageBox::warning(this,
+                                                         tr("Load MRI Model"),
+                                                         tr("Failed to load the selected MRI model.\nWould you like to choose another file?"),
+                                                         QMessageBox::Retry | QMessageBox::Cancel);
+                if (choice == QMessageBox::Retry)
+                {
+                    if (!promptForModelFile(modelPath, tr("Select MRI Segmentation Model")))
+                    {
+                        LOG_WARNING("MRI model selection canceled after failure", "Model", 2005);
+                        return;
+                    }
+                    continue;
+                }
+                LOG_WARNING("User canceled MRI model loading after failure", "Model", 2006);
+                return;
+            }
         }
+
+        AppConfig::instance().setMriModelPath(modelPath);
+        AppConfig::instance().saveConfig();
         refreshActionStates();
 
-        log(QString("MRI Segmentation ONNX loaded: %1").arg(modelPath));
+        log(tr("MRI model loaded: %1").arg(modelPath));
     }
     catch (const std::exception &e)
     {
-        QString errorMsg = QString("Failed to load MRI model: %1").arg(e.what());
-        LOG_ERROR(errorMsg, "Model", 2006);
-        QMessageBox::critical(this, "Model Loading Error", errorMsg);
+        const QString errorMsg = tr("Failed to load MRI model: %1").arg(e.what());
+        LOG_ERROR(errorMsg, "Model", 2007);
+        QMessageBox::critical(this, tr("Model Loading Error"), errorMsg);
     }
 }
 
@@ -687,21 +866,8 @@ void MainWindow::switchTask()
     if (dialog.exec() == QDialog::Accepted)
     {
         setTaskType(dialog.selectedTask());
-
-        // 清除当前状态，因为切换任务需要重新开始
         clearAll();
-
-        // 根据新任务类型更新窗口标题
-        if (dialog.selectedTask() == TaskSelectionDialog::MRI_Segmentation)
-        {
-            setWindowTitle("Med YOLO11 Qt - MRI Segmentation");
-        }
-        else
-        {
-            setWindowTitle("Med YOLO11 Qt - FAI X-Ray Detection");
-        }
-
-        log("Task switched");
+        log(tr("Task switched"));
     }
 }
 
@@ -717,14 +883,28 @@ void MainWindow::clearAll()
     m_batch.clear();
     if (m_list)
         m_list->clear();
+    if (m_batchFilter)
+        m_batchFilter->clear();
     m_segmentationMask = QImage();
-    statusBar()->showMessage("Cleared");
+    statusBar()->showMessage(tr("Workspace cleared"));
+    appendLog(tr("Workspace cleared"));
     refreshActionStates();
+}
+
+void MainWindow::appendLog(const QString &message)
+{
+    if (!m_logView)
+        return;
+    const QString line = QStringLiteral("[%1] %2")
+                             .arg(QDateTime::currentDateTime().toString("HH:mm:ss"),
+                                  message);
+    m_logView->appendPlainText(line);
 }
 
 void MainWindow::log(const QString &s)
 {
     statusBar()->showMessage(s, 5000);
+    appendLog(s);
     LOG_INFO(s, "MainWindow");
 }
 
@@ -1000,5 +1180,3 @@ bool MainWindow::saveJson(const QString &jsonPath,
     f.close();
     return true;
 }
-
-
