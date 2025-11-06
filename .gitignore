@@ -1,8 +1,9 @@
 build
 .vscode
 src_backup
-test
+tests
 weights
 .vs
 vcpkg_installed
 models
+test
