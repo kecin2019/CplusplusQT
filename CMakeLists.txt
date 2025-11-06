@@ -89,11 +89,15 @@ if(USE_ORT)
 endif()
 
 # ---------------- 源文件 ----------------
+# ---------------- Դ�ļ� ----------------
 file(GLOB SRC "src/*.cpp" "src/*.h")
-# 移除了 src/resources.qrc 引用
+set(QRC_FILES
+  resources/resources.qrc
+)
+# �Ƴ��� src/resources.qrc ����
 
-# ---------------- 目标配置 ----------------
-add_executable(medapp ${SRC})
+# ---------------- Ŀ������ ----------------
+add_executable(medapp ${SRC} ${QRC_FILES})
 target_include_directories(medapp PRIVATE 
   src 
   ${GDCM_INCLUDE_DIRS_FALLBACK}  # 添加GDCM头文件路径

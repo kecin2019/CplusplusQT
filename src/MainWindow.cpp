@@ -3,67 +3,66 @@
 #include "InferenceEngine.h"
 #include "DicomUtils.h"
 #include "MetaTable.h"
-#include <QToolBar>
-#include <QFileDialog>
-#include <QTabWidget>
-#include <QPlainTextEdit>
-#include <QSplitter>
-#include <QVBoxLayout>
-#include <QStatusBar>
+#include <QCoreApplication>
 #include <QAction>
-#include <QMessageBox>
-#include <QLabel>
-#include <QDockWidget>
-#include <QListWidget>
+#include <QDateTime>
 #include <QDirIterator>
-#include <QFileInfo>
-#include <QJsonDocument>
-#include <QJsonArray>
-#include <QJsonObject>
+#include <QDockWidget>
 #include <QFile>
-#include <qapplication.h>
+#include <QFileDialog>
+#include <QFileInfo>
+#include <QHBoxLayout>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QLabel>
+#include <QListWidget>
+#include <QMessageBox>
+#include <QPainter>
+#include <QPlainTextEdit>
+#include <QProgressBar>
+#include <QSlider>
+#include <QSplitter>
+#include <QStatusBar>
+#include <QTabWidget>
 #include <QTimer>
+#include <QToolBar>
+#include <QVBoxLayout>
+#include <QWidgetAction>
+#include <qapplication.h>
+#include <QtConcurrent/QtConcurrent>
+#include <algorithm>
 
-MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) { setupUi(); }
+MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
+{
+    setupUi();
+    setupDockWidgets();
+    setupConnections();
+}
 
 void MainWindow::setTaskType(TaskSelectionDialog::TaskType taskType)
 {
-    // 根据任务类型隐藏/显示相应的UI元素
-    if (taskType == TaskSelectionDialog::MRI_Segmentation)
-    {
-        // MRI分割模式：显示MRI加载按钮，隐藏X光加载按钮
-        if (m_actLoadMRI)
-            m_actLoadMRI->setVisible(true);
-        if (m_actLoadFAI)
-            m_actLoadFAI->setVisible(false);
-        // 可以在这里添加其他MRI特定的UI调整
-    }
-    else
-    {
-        // X光检测模式：显示X光加载按钮，隐藏MRI加载按钮
-        if (m_actLoadFAI)
-            m_actLoadFAI->setVisible(true);
-        if (m_actLoadMRI)
-            m_actLoadMRI->setVisible(false);
-        // 可以在这里添加其他X光特定的UI调整
-    }
+    m_currentTask = taskType;
+    updateTaskUi(taskType);
 }
+
 void MainWindow::setupUi()
 {
-    auto *tb = addToolBar("Main");
-    auto *actOpenImg = tb->addAction("Open Image");
-    auto *actOpenDicom = tb->addAction("Open DICOM");
-    auto *actOpenFolder = tb->addAction("Open Folder");
+    auto *tb = addToolBar(tr("Main"));
+    tb->setObjectName("MainToolbar");
+    auto *actOpenImg = tb->addAction(tr("Open Image"));
+    auto *actOpenDicom = tb->addAction(tr("Open DICOM"));
+    auto *actOpenFolder = tb->addAction(tr("Open Folder"));
 
     tb->addSeparator();
 
-    m_actLoadFAI = tb->addAction("Load FAI ONNX");
-    m_actLoadFAI->setVisible(false); // 初始隐藏
-    m_actRun = tb->addAction("Run Inference");
+    m_actLoadFAI = tb->addAction(tr("Load FAI ONNX"));
+    m_actLoadFAI->setVisible(false);
+    m_actRun = tb->addAction(tr("Run Inference"));
 
     tb->addSeparator();
 
-    auto *actClear = tb->addAction("Clear");
+    auto *actClear = tb->addAction(tr("Clear"));
 
     connect(actOpenImg, &QAction::triggered, this, &MainWindow::openImage);
     connect(actOpenDicom, &QAction::triggered, this, &MainWindow::openDicom);
@@ -72,38 +71,56 @@ void MainWindow::setupUi()
     connect(m_actRun, &QAction::triggered, this, &MainWindow::runInference);
     connect(actClear, &QAction::triggered, this, &MainWindow::clearAll);
 
-    // ---- 中心区域：左图右信息 ----
+    tb->addSeparator();
+    m_actLogDock = tb->addAction(tr("Show Log"));
+    m_actLogDock->setCheckable(true);
+    m_actLogDock->setChecked(true);
+    connect(m_actLogDock, &QAction::toggled, this, &MainWindow::toggleLogDock);
+
+    tb->addSeparator();
+    m_overlaySlider = new QSlider(Qt::Horizontal, this);
+    m_overlaySlider->setRange(0, 100);
+    m_overlaySlider->setValue(100);
+    m_overlaySlider->setToolTip(tr("Segmentation overlay opacity"));
+    m_overlayAction = new QWidgetAction(this);
+    m_overlayAction->setDefaultWidget(m_overlaySlider);
+    m_overlayAction->setText(tr("Overlay Opacity"));
+    tb->addAction(m_overlayAction);
+    m_overlayAction->setVisible(false);
+    connect(m_overlaySlider, &QSlider::valueChanged, this, &MainWindow::updateOverlayOpacity);
+
+    // ---- ����������ͼ����Ϣ ----
     m_splitter = new QSplitter(this);
     m_viewTabs = new QTabWidget(this);
     m_inputView = new ImageView(this);
     m_outputView = new ImageView(this);
-    m_viewTabs->addTab(m_inputView, "Input");
-    m_viewTabs->addTab(m_outputView, "Output");
+    m_viewTabs->addTab(m_inputView, tr("Input"));
+    m_viewTabs->addTab(m_outputView, tr("Output"));
 
-    // 右侧：上下分割（上=Metadata，下=文件列表）
+    // �Ҳࣺ���·ָ��=Metadata����=�ļ��б���
     QSplitter *rightSplit = new QSplitter(Qt::Vertical, this);
 
-    // --- 上：Metadata 面板 ---
+    // --- �ϣ�Metadata ��� ---
     auto *metaPanel = new QWidget(this);
     auto *metaLayout = new QVBoxLayout(metaPanel);
     metaLayout->setContentsMargins(12, 12, 12, 12);
     metaLayout->setSpacing(8);
-    auto *metaLabel = new QLabel("Metadata (DICOM tags or file info)", this);
+    auto *metaLabel = new QLabel(tr("Metadata (DICOM tags or file info)"), this);
     m_meta = new MetaTable(this);
     metaLayout->addWidget(metaLabel);
     metaLayout->addWidget(m_meta, 1);
     rightSplit->addWidget(metaPanel);
 
-    // --- 下：Batch Files（从左侧 Dock 移到这里） ---
+    // --- �£�Batch Files ---
     auto *filesPanel = new QWidget(this);
     auto *filesLayout = new QVBoxLayout(filesPanel);
     filesLayout->setContentsMargins(12, 8, 12, 12);
     filesLayout->setSpacing(8);
 
     auto *filesHeader = new QHBoxLayout();
-    auto *filesTitle = new QLabel("Batch Files", this);
+    auto *filesTitle = new QLabel(tr("Batch Files"), this);
     auto *filterEdit = new QLineEdit(this);
-    filterEdit->setPlaceholderText("Filter...");
+    filterEdit->setPlaceholderText(tr("Filter..."));
     filesHeader->addWidget(filesTitle);
     filesHeader->addStretch();
     filesHeader->addWidget(filterEdit);
@@ -113,94 +130,265 @@ void MainWindow::setupUi()
     filesLayout->addWidget(m_list, 1);
     rightSplit->addWidget(filesPanel);
 
-    // 简单的文件名过滤
-    connect(filterEdit, &QLineEdit::textChanged, this, [this](const QString &s)
-            {
-    for (int i = 0; i < m_list->count(); ++i) {
-        auto *it = m_list->item(i);
-        it->setHidden(!it->text().contains(s, Qt::CaseInsensitive));
-    } });
-    // 保持原有选择回调
+    connect(filterEdit, &QLineEdit::textChanged, this, [this](const QString &s) {
+        for (int i = 0; i < m_list->count(); ++i)
+        {
+            auto *it = m_list->item(i);
+            it->setHidden(!it->text().contains(s, Qt::CaseInsensitive));
+        }
+    });
     connect(m_list, &QListWidget::itemSelectionChanged, this, &MainWindow::onListActivated);
 
-    // 拼到主分割器
     m_splitter->addWidget(m_viewTabs);
     m_splitter->addWidget(rightSplit);
+    m_splitter->setStretchFactor(0, 7);
+    m_splitter->setStretchFactor(1, 3);
 
-    // 让图片更大
-    // 让左侧图像区域更大
-    m_splitter->setStretchFactor(0, 7); // 左侧
-    m_splitter->setStretchFactor(1, 3); // 右侧
-
-    // 初始显示时就给出更大的左侧宽度（需在窗口显示后设置）
-    QTimer::singleShot(0, this, [this]()
-                       {
+    QTimer::singleShot(0, this, [this]() {
         const int w = this->width();
-        m_splitter->setSizes({ int(w*0.75), int(w*0.25) }); });
+        m_splitter->setSizes({int(w * 0.75), int(w * 0.25)});
+    });
 
-    rightSplit->setStretchFactor(0, 2); // 上面板权重大些（Metadata）
-    rightSplit->setStretchFactor(1, 1); // 下面板（文件列表）
+    rightSplit->setStretchFactor(0, 2);
+    rightSplit->setStretchFactor(1, 1);
 
     setCentralWidget(m_splitter);
-    statusBar()->showMessage("Ready");
+    statusBar()->showMessage(tr("Ready"));
 
-    m_actExport = tb->addAction("Export Result");
-    m_actExportAll = tb->addAction("Batch Export");
-
+    m_actExport = tb->addAction(tr("Export Result"));
+    m_actExportAll = tb->addAction(tr("Batch Export"));
     connect(m_actExport, &QAction::triggered, this, &MainWindow::exportCurrent);
     connect(m_actExportAll, &QAction::triggered, this, &MainWindow::exportBatch);
 
-    m_actBatch = tb->addAction("Batch Infer");
+    m_actBatch = tb->addAction(tr("Batch Infer"));
     connect(m_actBatch, &QAction::triggered, this, &MainWindow::runBatchInference);
 
-    // 添加MRI分割功能（初始隐藏，根据任务类型显示）
     tb->addSeparator();
-    m_actLoadMRI = tb->addAction("Load MRI Model");
+    m_actLoadMRI = tb->addAction(tr("Load MRI Model"));
     connect(m_actLoadMRI, &QAction::triggered, this, &MainWindow::loadMRIModel);
-    m_actLoadMRI->setVisible(false); // 初始隐藏
+    m_actLoadMRI->setVisible(false);
 
-    // 添加任务切换按钮
     tb->addSeparator();
-    auto *actSwitchTask = tb->addAction("Switch Task");
+    auto *actSwitchTask = tb->addAction(tr("Switch Task"));
     connect(actSwitchTask, &QAction::triggered, this, &MainWindow::switchTask);
 
-    // 初始：未加载模型时禁用推理/导出/批处理
     for (QAction *a : {m_actRun, m_actBatch, m_actExport, m_actExportAll})
         if (a)
             a->setEnabled(false);
 
-    // 亮色 Fusion
-    qApp->setStyle("Fusion");
-    QPalette pal = qApp->palette(); // Fusion 默认就是亮色，这里只微调
-    pal.setColor(QPalette::Highlight, QColor(52, 120, 246));
-    pal.setColor(QPalette::HighlightedText, Qt::white);
-    qApp->setPalette(pal);
+    m_progress = new QProgressBar(this);
+    m_progress->setObjectName("InferenceProgress");
+    m_progress->setTextVisible(false);
+    m_progress->setMinimumWidth(140);
+    m_progress->setVisible(false);
+    statusBar()->addPermanentWidget(m_progress, 0);
 
-    // 轻量 QSS：圆角 + 浅边框 + 明亮背景
-    setStyleSheet(R"(
-QMainWindow { background:#F7F8FA; }
-QToolBar { background:#F7F8FA; border:none; padding:6px; spacing:8px; }
-
-QToolButton { border-radius:10px; padding:6px 10px; }
-QToolButton:hover { background:#EBEEF2; }
-
-QTabWidget::pane { border:1px solid #E4E7EC; border-radius:12px; padding:6px; background:#FFFFFF; }
-QTabBar::tab {
-  background:#FFFFFF; border:1px solid #E4E7EC; border-bottom:none;
-  padding:6px 12px; margin-right:4px; border-top-left-radius:10px; border-top-right-radius:10px;
-}
-QTabBar::tab:selected { background:#F2F4F7; }
-
-QListWidget, QTableWidget, QLineEdit, QPlainTextEdit {
-  background:#FFFFFF; border:1px solid #E4E7EC; border-radius:12px; padding:8px;
-}
-QHeaderView::section {
-  background:#F7F8FA; border:1px solid #E4E7EC; padding:6px; border-radius:8px;
+    updateTaskUi(m_currentTask);
 }
 
-QStatusBar { background:#F7F8FA; border-top:1px solid #E4E7EC; }
-)");
+void MainWindow::setupDockWidgets()
+{
+    if (m_logDock)
+        return;
+
+    m_logDock = new QDockWidget(tr("Runtime Log"), this);
+    m_logDock->setObjectName("LogDock");
+    m_logView = new QPlainTextEdit(m_logDock);
+    m_logView->setReadOnly(true);
+    m_logView->setMaximumBlockCount(2000);
+    m_logDock->setWidget(m_logView);
+    addDockWidget(Qt::BottomDockWidgetArea, m_logDock);
+
+    connect(m_logDock, &QDockWidget::visibilityChanged, this, [this](bool visible) {
+        if (m_actLogDock && m_actLogDock->isChecked() != visible)
+            m_actLogDock->setChecked(visible);
+    });
 }
+
+void MainWindow::setupConnections()
+{
+    connect(&m_inferWatcher, &QFutureWatcher<InferenceEngine::Result>::finished,
+            this, &MainWindow::onInferenceFinished);
+
+    connect(&m_modelManager, &ModelManager::modelLoaded, this,
+            [this](ModelManager::ModelType, const QString &path) {
+                appendLog(tr("Model loaded: %1").arg(path));
+            });
+
+    connect(&m_modelManager, &ModelManager::modelLoadFailed, this,
+            [this](ModelManager::ModelType, const QString &path, const QString &reason) {
+                const QString msg = tr("Model load failed: %1 (%2)").arg(path, reason);
+                appendLog(msg);
+                QMessageBox::warning(this, tr("Load Model"), msg);
+            });
+
+    m_modelManager.setRootDirectory(QCoreApplication::applicationDirPath() + "/models");
+}
+
+void MainWindow::appendLog(const QString &line)
+{
+    if (!m_logView)
+        return;
+    const QString timeStamp = QDateTime::currentDateTime().toString("HH:mm:ss");
+    m_logView->appendPlainText(QStringLiteral("[%1] %2").arg(timeStamp, line));
+}
+
+void MainWindow::toggleLogDock(bool checked)
+{
+    if (!m_logDock)
+        return;
+    m_logDock->setVisible(checked);
+}
+
+void MainWindow::updateTaskUi(TaskSelectionDialog::TaskType taskType)
+{
+    const bool isSegmentation = (taskType == TaskSelectionDialog::MRI_Segmentation);
+
+    if (m_actLoadFAI)
+        m_actLoadFAI->setVisible(!isSegmentation);
+    if (m_actLoadMRI)
+        m_actLoadMRI->setVisible(isSegmentation);
+
+    if (m_overlayAction)
+        m_overlayAction->setVisible(isSegmentation);
+    if (m_overlaySlider)
+    {
+        m_overlaySlider->setEnabled(isSegmentation);
+        if (!isSegmentation)
+        {
+            m_overlaySlider->blockSignals(true);
+            m_overlaySlider->setValue(100);
+            m_overlaySlider->blockSignals(false);
+        }
+    }
+
+    if (isSegmentation)
+        setWindowTitle(tr("Med YOLO11 Qt - MRI Segmentation"));
+    else
+        setWindowTitle(tr("Med YOLO11 Qt - FAI X-Ray Detection"));
+
+    toggleInferenceActions(isSegmentation ? m_mriModelReady : m_modelReady);
+}
+
+void MainWindow::toggleInferenceActions(bool enabled)
+{
+    for (QAction *action : {m_actRun, m_actBatch, m_actExport, m_actExportAll})
+        if (action)
+            action->setEnabled(enabled);
+}
+
+bool MainWindow::ensureActiveModel()
+{
+    if (m_currentTask == TaskSelectionDialog::MRI_Segmentation)
+    {
+        if (!m_mriModelReady)
+        {
+            QMessageBox::information(this, tr("Load Model"), tr("Please load the MRI model first."));
+            return false;
+        }
+    }
+    else if (!m_modelReady)
+    {
+        QMessageBox::information(this, tr("Load Model"), tr("Please load the FAI model first."));
+        return false;
+    }
+    return true;
+}
+
+void MainWindow::startAsyncInference()
+{
+    m_isRunning = true;
+    toggleInferenceActions(false);
+
+    if (m_progress)
+    {
+        m_progress->setRange(0, 0);
+        m_progress->setVisible(true);
+    }
+
+    const auto task = (m_currentTask == TaskSelectionDialog::MRI_Segmentation)
+                          ? InferenceEngine::Task::HipMRI_Seg
+                          : InferenceEngine::Task::FAI_XRay;
+
+    auto future = QtConcurrent::run([engine = &activeEngine(), img = m_input, task]() {
+        return engine->run(img, task);
+    });
+    m_inferWatcher.setFuture(future);
+    const QString tag = m_currentPath.isEmpty() ? tr("current image") : m_currentPath;
+    appendLog(tr("Inference started: %1").arg(tag));
+}
+
+void MainWindow::onInferenceFinished()
+{
+    if (m_progress)
+    {
+        m_progress->setVisible(false);
+        m_progress->setRange(0, 1);
+        m_progress->setValue(0);
+    }
+
+    toggleInferenceActions(true);
+    m_isRunning = false;
+
+    const auto result = m_inferWatcher.result();
+
+    if (!m_currentPath.isEmpty())
+    {
+        m_cacheImg[m_currentPath] = result.outputImage;
+        m_cacheDets[m_currentPath] = result.dets;
+        if (!result.segmentationMask.isNull())
+            m_cacheSegmentation[m_currentPath] = result.segmentationMask;
+        else
+            m_cacheSegmentation.remove(m_currentPath);
+    }
+
+    m_output = result.outputImage;
+    m_lastDets = result.dets;
+    if (m_currentTask == TaskSelectionDialog::MRI_Segmentation)
+        m_segmentationMask = result.segmentationMask;
+    else
+        m_segmentationMask = QImage();
+
+    setOutputImage(result.outputImage);
+    statusBar()->showMessage(tr("Inference done"), 3000);
+    appendLog(result.summary);
+}
+
+void MainWindow::resetInferenceState()
+{
+    m_isRunning = false;
+    if (m_progress)
+    {
+        m_progress->setVisible(false);
+        m_progress->setRange(0, 1);
+        m_progress->setValue(0);
+    }
+    const bool ready = (m_currentTask == TaskSelectionDialog::MRI_Segmentation) ? m_mriModelReady : m_modelReady;
+    toggleInferenceActions(ready);
+}
+
+void MainWindow::updateOverlayOpacity(int value)
+{
+    value = std::clamp(value, 0, 100);
+    m_overlayOpacity = value / 100.0f;
+    if (!m_output.isNull() && m_currentTask == TaskSelectionDialog::MRI_Segmentation && !m_segmentationMask.isNull())
+        setOutputImage(m_output);
+}
+
+InferenceEngine &MainWindow::activeEngine()
+{
+    if (m_currentTask == TaskSelectionDialog::MRI_Segmentation)
+        return m_mriEngine;
+    return m_engine;
+}
+
+ModelManager::ModelType MainWindow::resolveModelType() const
+{
+    return (m_currentTask == TaskSelectionDialog::MRI_Segmentation)
+               ? ModelManager::ModelType::MRI_Segmentation
+               : ModelManager::ModelType::FAI_XRay;
+}
+
 void MainWindow::openImage()
 {
     QString f = QFileDialog::getOpenFileName(this, "Open Image", QString(),
@@ -224,6 +412,9 @@ void MainWindow::openFolder()
         return;
     m_batch.clear();
     m_list->clear();
+    m_cacheImg.clear();
+    m_cacheDets.clear();
+    m_cacheSegmentation.clear();
     QDirIterator it(dir, QDir::Files, QDirIterator::Subdirectories);
     while (it.hasNext())
     {
@@ -250,10 +441,13 @@ void MainWindow::onListActivated()
 
     loadPath(sel); // 会更新输入视图、元数据、m_currentPath
 
-    if (m_cacheImg.contains(sel))
+    auto itImg = m_cacheImg.find(sel);
+    if (itImg != m_cacheImg.end())
     {
-        m_output = m_cacheImg.value(sel);
+        m_output = itImg.value();
         m_lastDets = m_cacheDets.value(sel);
+        if (m_currentTask == TaskSelectionDialog::MRI_Segmentation)
+            m_segmentationMask = m_cacheSegmentation.value(sel);
         setOutputImage(m_output);
     }
     else if (m_modelReady || m_mriModelReady)
@@ -272,71 +466,41 @@ void MainWindow::onListActivated()
 }
 void MainWindow::runInference()
 {
+    if (m_isRunning)
+    {
+        statusBar()->showMessage(tr("Inference already running"), 2000);
+        return;
+    }
+
     if (m_input.isNull())
     {
-        QMessageBox::information(this, "Run Inference", "Please load an image first.");
+        QMessageBox::information(this, tr("Run Inference"), tr("Please load an image first."));
         return;
     }
 
-    if (!m_modelReady && !m_mriModelReady)
-    {
-        QMessageBox::information(this, "Run Inference", "Please load an ONNX model first.");
+    if (!ensureActiveModel())
         return;
-    }
 
-    InferenceEngine::Result result;
-    if (m_modelReady)
-    {
-        // X光检测任务
-        result = m_engine.run(m_input, InferenceEngine::Task::FAI_XRay);
-    }
-    else if (m_mriModelReady)
-    {
-        // MRI分割任务
-        result = m_mriEngine.run(m_input, InferenceEngine::Task::HipMRI_Seg);
-        m_segmentationMask = result.segmentationMask;
-    }
-
-    // —— 写入缓存（以当前路径为 key）——
-    if (!m_currentPath.isEmpty())
-    {
-        m_cacheImg[m_currentPath] = result.outputImage;
-        m_cacheDets[m_currentPath] = result.dets;
-    }
-
-    m_output = result.outputImage;
-    m_lastDets = result.dets;
-
-    setOutputImage(result.outputImage);
-    log(QString("Inference: %1").arg(result.summary));
-    statusBar()->showMessage("Inference done");
+    startAsyncInference();
 }
 
 void MainWindow::runBatchInference()
 {
-    if (!m_modelReady)
-    {
-        QMessageBox::information(this, "Batch Export", "Please load an ONNX model first.");
+    if (!ensureActiveModel())
         return;
-    }
 
     if (!m_list || m_list->count() == 0)
     {
-        QMessageBox::information(this, "Batch Infer", "Batch list is empty.");
+        QMessageBox::information(this, tr("Batch Infer"), tr("Batch list is empty."));
         return;
     }
+
+    const bool segmentation = (m_currentTask == TaskSelectionDialog::MRI_Segmentation);
     int ok = 0, fail = 0;
+
     for (int i = 0; i < m_list->count(); ++i)
     {
         const QString path = m_list->item(i)->text();
-
-        // 已有缓存则跳过（如需强制重跑，可清缓存）
-        if (m_cacheImg.contains(path))
-        {
-            ++ok;
-            continue;
-        }
-
         QImage in;
         if (isDicomFile(path))
         {
@@ -367,56 +531,74 @@ void MainWindow::runBatchInference()
         }
 
         InferenceEngine::Result res;
-        if (m_modelReady)
+        auto itImg = m_cacheImg.find(path);
+        auto itDet = m_cacheDets.find(path);
+        auto itMask = m_cacheSegmentation.find(path);
+        if (segmentation && itImg != m_cacheImg.end() && itMask != m_cacheSegmentation.end())
         {
-            res = m_engine.run(in, InferenceEngine::Task::FAI_XRay);
+            res.outputImage = itImg.value();
+            res.segmentationMask = itMask.value();
         }
-        else if (m_mriModelReady)
+        else if (!segmentation && itImg != m_cacheImg.end() && itDet != m_cacheDets.end())
         {
-            res = m_mriEngine.run(in, InferenceEngine::Task::HipMRI_Seg);
+            res.outputImage = itImg.value();
+            res.dets = itDet.value();
         }
-        m_cacheImg[path] = res.outputImage;
-        m_cacheDets[path] = res.dets;
+        else
+        {
+            res = segmentation ? m_mriEngine.run(in, InferenceEngine::Task::HipMRI_Seg)
+                                : m_engine.run(in, InferenceEngine::Task::FAI_XRay);
+            m_cacheImg[path] = res.outputImage;
+            if (segmentation)
+            {
+                if (!res.segmentationMask.isNull())
+                    m_cacheSegmentation[path] = res.segmentationMask;
+            }
+            else
+            {
+                m_cacheDets[path] = res.dets;
+                m_cacheSegmentation.remove(path);
+            }
+        }
         ++ok;
 
-        // UI 反馈（可选）：边跑边显示当前
         if (path == m_currentPath)
         {
             m_output = res.outputImage;
             m_lastDets = res.dets;
+            if (segmentation)
+                m_segmentationMask = res.segmentationMask;
             setOutputImage(m_output);
         }
+
         qApp->processEvents();
     }
-    QMessageBox::information(this, "Batch Infer",
-                             QString("Done. Success: %1, Failed: %2").arg(ok).arg(fail));
+
+    QMessageBox::information(this, tr("Batch Infer"),
+                             tr("Done. Success: %1, Failed: %2").arg(ok).arg(fail));
+    appendLog(tr("Batch inference finished. Success: %1, Failed: %2").arg(ok).arg(fail));
 }
 
 void MainWindow::loadFAIModel()
 {
-    // 使用相对路径加载模型，避免嵌入大文件到资源中
-    QString modelPath = QCoreApplication::applicationDirPath() + "/models/fai_xray.onnx";
-
-    // 检查文件是否存在
-    if (!QFileInfo::exists(modelPath))
+    if (m_modelManager.loadModel(ModelManager::ModelType::FAI_XRay, m_engine))
     {
-        QMessageBox::warning(this, "Load Model",
-                             QString("Model file not found at: %1").arg(modelPath));
-        return;
+        m_modelReady = true;
+        toggleInferenceActions(m_currentTask == TaskSelectionDialog::FAI_XRay);
+        const QString modelPath = m_modelManager.loadedModelPath(ModelManager::ModelType::FAI_XRay);
+        log(tr("FAI model ready: %1").arg(modelPath));
     }
+}
 
-    m_faiOnnxPath = modelPath;
-    m_modelReady = m_engine.loadModel(m_faiOnnxPath, InferenceEngine::Task::FAI_XRay);
-    if (!m_modelReady)
+void MainWindow::loadMRIModel()
+{
+    if (m_modelManager.loadModel(ModelManager::ModelType::MRI_Segmentation, m_mriEngine))
     {
-        QMessageBox::warning(this, "Load Model", "Failed to load ONNX model.");
-        return;
+        m_mriModelReady = true;
+        toggleInferenceActions(m_currentTask == TaskSelectionDialog::MRI_Segmentation);
+        const QString modelPath = m_modelManager.loadedModelPath(ModelManager::ModelType::MRI_Segmentation);
+        log(tr("MRI model ready: %1").arg(modelPath));
     }
-    for (QAction *a : {m_actRun, m_actBatch, m_actExport, m_actExportAll})
-        if (a)
-            a->setEnabled(true);
-
-    log(QString("FAI ONNX loaded: %1").arg(modelPath));
 }
 
 void MainWindow::loadMRIModel()
@@ -472,6 +654,7 @@ void MainWindow::switchTask()
 
 void MainWindow::clearAll()
 {
+    resetInferenceState();
     m_input = QImage();
     m_inputView->clearImage();
     m_outputView->clearImage();
@@ -479,14 +662,18 @@ void MainWindow::clearAll()
     m_currentPath.clear();
     m_batch.clear();
     m_list->clear();
+    m_cacheImg.clear();
+    m_cacheDets.clear();
+    m_cacheSegmentation.clear();
     m_segmentationMask = QImage();
-    statusBar()->showMessage("Cleared");
+    statusBar()->showMessage(tr("Cleared"));
+    appendLog(tr("Workspace cleared"));
 }
 
 void MainWindow::log(const QString &s)
 {
     statusBar()->showMessage(s, 5000);
-    qDebug() << s;
+    appendLog(s);
 }
 
 void MainWindow::setInputImage(const QImage &img)
@@ -497,11 +684,27 @@ void MainWindow::setInputImage(const QImage &img)
 }
 void MainWindow::setOutputImage(const QImage &img)
 {
-    // 结果图不再重新 fit，直接保持与输入图相同缩放
-    m_outputView->setImage(img, false);
+    QImage display = img;
+
+    if (m_currentTask == TaskSelectionDialog::MRI_Segmentation && !m_segmentationMask.isNull())
+    {
+        QImage base = img.convertToFormat(QImage::Format_ARGB32);
+        QImage mask = m_segmentationMask;
+        if (mask.size() != base.size())
+            mask = mask.scaled(base.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+
+        QPainter painter(&base);
+        painter.setOpacity(m_overlayOpacity);
+        painter.drawImage(QPoint(0, 0), mask);
+        painter.end();
+        display = base;
+    }
+
+    m_outputView->setImage(display, false);
     m_outputView->setTransform(m_inputView->transform());
     m_viewTabs->setCurrentWidget(m_outputView);
 }
+
 void MainWindow::updateMetaTable(const QMap<QString, QString> &meta) { m_meta->setData(meta); }
 bool MainWindow::isImageFile(const QString &path)
 {
@@ -521,6 +724,7 @@ void MainWindow::loadPath(const QString &path)
         }
         m_currentPath = path;
         setInputImage(img);
+        m_segmentationMask = QImage();
         QMap<QString, QString> meta;
         meta["Type"] = "Image";
         meta["Path"] = path;
@@ -544,6 +748,7 @@ void MainWindow::loadPath(const QString &path)
 #endif
         m_currentPath = path;
         setInputImage(img);
+        m_segmentationMask = QImage();
         updateMetaTable(meta);
         log(QString("Loaded DICOM: %1").arg(path));
     }

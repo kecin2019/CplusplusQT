@@ -1,4 +1,8 @@
 #include <QApplication>
+#include <QFile>
+#include <QIODevice>
+#include <QTextStream>
+
 #include "MainWindow.h"
 #include "TaskSelectionDialog.h"
 
@@ -7,6 +11,14 @@ int main(int argc, char *argv[])
     QApplication app(argc, argv);
     QApplication::setApplicationName("Med YOLO11 Qt");
     QApplication::setOrganizationName("YourLab");
+
+    QFile themeFile(":/styles/light.qss");
+    if (themeFile.open(QIODevice::ReadOnly | QIODevice::Text))
+    {
+        QTextStream stream(&themeFile);
+        const QString qss = stream.readAll();
+        app.setStyleSheet(qss);
+    }
 
     // 显示任务选择对话框
     TaskSelectionDialog taskDialog;

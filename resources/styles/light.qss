@@ -1,0 +1,61 @@
+QMainWindow {
+    background: #F6F7F9;
+}
+
+QToolBar {
+    background: #FFFFFF;
+    border: 0px;
+    padding: 6px;
+    spacing: 8px;
+}
+
+QToolButton {
+    border-radius: 8px;
+    padding: 6px 10px;
+}
+
+QToolButton:hover {
+    background: #E9ECF3;
+}
+
+QTabWidget::pane {
+    border: 1px solid #D8DCE5;
+    border-radius: 10px;
+    padding: 6px;
+    background: #FFFFFF;
+}
+
+QTabBar::tab {
+    background: #FFFFFF;
+    border: 1px solid #D8DCE5;
+    border-bottom: none;
+    padding: 6px 12px;
+    margin-right: 4px;
+    border-top-left-radius: 10px;
+    border-top-right-radius: 10px;
+}
+
+QTabBar::tab:selected {
+    background: #EEF1F7;
+}
+
+QListWidget,
+QTableWidget,
+QLineEdit,
+QPlainTextEdit {
+    background: #FFFFFF;
+    border: 1px solid #D8DCE5;
+    border-radius: 10px;
+    padding: 8px;
+}
+
+QStatusBar {
+    background: #FFFFFF;
+    border-top: 1px solid #D8DCE5;
+}
+
+QDockWidget::title {
+    background: #F0F2F7;
+    padding: 4px 8px;
+    font-weight: bold;
+}
