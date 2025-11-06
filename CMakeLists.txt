@@ -1,34 +1,108 @@
-# CMakeLists.txt
-
-# 设置最低CMake版本
+# MedYOLO11Qt - 医学图像 AI 分析软件
+# CMake 构建配置文件
+# 基于 Qt 6 + ONNXRuntime + GDCM 的现代化医学影像处理平台
 
 cmake_minimum_required(VERSION 3.18)
-project(MedYOLO11Qt LANGUAGES CXX)
+project(MedYOLO11Qt 
+  VERSION 1.0.0
+  DESCRIPTION "Medical Image Analysis Software with YOLO11 AI Classification"
+  LANGUAGES CXX
+)
 
-# 设置Windows平台UTF-8编码支持
-# if(WIN32)
-#     add_compile_options(/utf-8)
-#     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /MANIFEST:NO")
-#     add_compile_definitions(UNICODE _UNICODE)
-# endif()
+# =============================================================================
+# 基础配置
+# =============================================================================
 
+# C++ 标准配置
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Qt 自动 moc/uic/rcc
+# Qt 自动化工具配置
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTORCC ON)
 
-# 选项（保持启用GDCM和ORT）
-option(USE_GDCM "Enable DICOM reading via GDCM (libgdcm)" ON)
-option(USE_ORT  "Enable ONNXRuntime for FAI classification" ON)
+# 构建类型配置
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
 
-# ---------------- 手动指定 Qt 路径 ----------------
-# 注意：Qt路径需精确到编译器目录（根据你的VS版本选择，如msvc2022_64）
-set(QT_INSTALL_PATH "E:/tools/Qt/6.9.2/msvc2022_64")  # 替换为实际编译器目录
-set(CMAKE_PREFIX_PATH ${QT_INSTALL_PATH})  # 告诉CMake从这里找Qt
+# =============================================================================
+# 功能选项配置
+# =============================================================================
+
+# 核心功能开关
+option(USE_GDCM "启用 DICOM 医学影像支持 (通过 GDCM 库)" ON)
+option(USE_ORT  "启用 ONNXRuntime AI 推理引擎" ON)
+
+# Windows 平台特定配置
+if(WIN32)
+  # GUI 应用程序配置
+  set(CMAKE_WIN32_EXECUTABLE ON)
+  
+  # 运行时库配置
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+endif()
+
+# =============================================================================
+# Qt 6 框架配置
+# =============================================================================
+
+# Qt 安装路径配置（根据实际安装位置调整）
+set(QT_INSTALL_PATH "E:/tools/Qt/6.9.2/msvc2022_64" CACHE PATH "Qt 6 安装路径")
+set(CMAKE_PREFIX_PATH ${QT_INSTALL_PATH})
+
+# 查找 Qt6 组件
 find_package(Qt6 REQUIRED COMPONENTS Widgets)
+
+# Qt 版本信息输出
+message(STATUS "Qt 版本: ${Qt6_VERSION}")
+message(STATUS "Qt 安装路径: ${QT_INSTALL_PATH}")
+
+# =============================================================================
+# GDCM 医学影像库配置
+# =============================================================================
+
+if(USE_GDCM)
+  message(STATUS "正在配置 GDCM 医学影像库...")
+  
+  # GDCM 安装路径
+  set(GDCM_INSTALL_PATH "E:/tools/GDCM-3.2.0-Windows-x86_64" CACHE PATH "GDCM 安装路径")
+  set(GDCM_INCLUDE_DIRS ${GDCM_INSTALL_PATH}/include/gdcm-3.2)
+  set(GDCM_LIBRARY_DIR ${GDCM_INSTALL_PATH}/lib)
+  
+  # 查找 GDCM 核心库
+  find_library(GDCM_MSFF_LIB
+    NAMES gdcmMSFF
+    PATHS ${GDCM_LIBRARY_DIR} 
+    NO_DEFAULT_PATH
+  )
+  
+  find_library(GDCM_COMMON_LIB
+    NAMES gdcmCommon
+    PATHS ${GDCM_LIBRARY_DIR}
+    NO_DEFAULT_PATH
+  )
+  
+  find_library(GDCM_DSED_LIB
+    NAMES gdcmDSED
+    PATHS ${GDCM_LIBRARY_DIR}
+    NO_DEFAULT_PATH
+  )
+
+  # 验证 GDCM 库
+  if(GDCM_MSFF_LIB AND GDCM_COMMON_LIB AND GDCM_DSED_LIB AND EXISTS ${GDCM_INCLUDE_DIRS})
+    message(STATUS "✅ GDCM 配置成功")
+    message(STATUS "   安装路径: ${GDCM_INSTALL_PATH}")
+    list(APPEND GDCM_LIBS ${GDCM_MSFF_LIB} ${GDCM_COMMON_LIB} ${GDCM_DSED_LIB})
+    set(GDCM_INCLUDE_DIRS_FALLBACK ${GDCM_INCLUDE_DIRS})
+    add_compile_definitions(HAVE_GDCM)
+  else()
+    message(FATAL_ERROR "❌ GDCM 库未找到，请检查安装路径: ${GDCM_INSTALL_PATH}")
+    set(USE_GDCM OFF)
+  endif()
+endif()
 
 # ---------------- GDCM（DICOM库） ----------------
 if(USE_GDCM)
@@ -89,13 +163,24 @@ if(USE_ORT)
 endif()
 
 # ---------------- 源文件 ----------------
-file(GLOB SRC "src/*.cpp" "src/*.h")
-# 移除了 src/resources.qrc 引用
+# 新的模块化源文件结构
+file(GLOB CORE_SRC "src/core/*.cpp" "src/core/*.h")
+file(GLOB AI_SRC "src/ai/*.cpp" "src/ai/*.h") 
+file(GLOB UI_SRC "src/ui/*.cpp" "src/ui/*.h")
+file(GLOB MEDICAL_SRC "src/medical/*.cpp" "src/medical/*.h")
+
+# 合并所有源文件
+set(SRC ${CORE_SRC} ${AI_SRC} ${UI_SRC} ${MEDICAL_SRC})
 
 # ---------------- 目标配置 ----------------
 add_executable(medapp ${SRC})
 target_include_directories(medapp PRIVATE 
   src 
+  src/core
+  src/ai
+  src/ui
+  src/medical
+  include
   ${GDCM_INCLUDE_DIRS_FALLBACK}  # 添加GDCM头文件路径
   ${ONNXRUNTIME_INCLUDE_DIR}     # 添加ONNX头文件路径
 )
@@ -156,19 +241,19 @@ if(WIN32)
       $<TARGET_FILE_DIR:medapp>/platforms/
     )
   endif()
-  # 复制模型文件
+  # 复制模型文件 - 更新路径
   add_custom_command(TARGET medapp POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory
     $<TARGET_FILE_DIR:medapp>/models/
   )
   add_custom_command(TARGET medapp POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    ${CMAKE_SOURCE_DIR}/models/fai_xray.onnx
+    ${CMAKE_SOURCE_DIR}/models/original/fai_xray.onnx
     $<TARGET_FILE_DIR:medapp>/models/
   )
   add_custom_command(TARGET medapp POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    ${CMAKE_SOURCE_DIR}/models/mri_segmentation.onnx
+    ${CMAKE_SOURCE_DIR}/models/original/mri_segmentation.onnx
     $<TARGET_FILE_DIR:medapp>/models/
   )
   
@@ -214,15 +299,20 @@ if(WIN32)
   endif()
   
   # 安装模型文件
-  # 在文件末尾添加加密工具
-  add_executable(encrypt_model tools/encrypt_model.cpp)
+  # 加密工具 - 更新路径
+  add_executable(encrypt_model scripts/maintenance/tools/encrypt_model.cpp)
   target_link_libraries(encrypt_model PRIVATE Qt6::Core)
   
-  # 安装时复制加密后的模型文件
-  install(FILES "${CMAKE_SOURCE_DIR}/models/fai_xray.encrypted"
-          DESTINATION bin/models RENAME "fai_xray.onnx")
-  install(FILES "${CMAKE_SOURCE_DIR}/models/mri_segmentation.onnx"
+  # 安装时复制模型文件 - 更新路径
+  install(FILES "${CMAKE_SOURCE_DIR}/models/original/fai_xray.onnx"
           DESTINATION bin/models)
+  install(FILES "${CMAKE_SOURCE_DIR}/models/original/mri_segmentation.onnx"
+          DESTINATION bin/models)
+  # 安装加密模型
+  if(EXISTS "${CMAKE_SOURCE_DIR}/models/encrypted/fai_xray.encrypted")
+    install(FILES "${CMAKE_SOURCE_DIR}/models/encrypted/fai_xray.encrypted"
+            DESTINATION bin/models RENAME "fai_xray.onnx")
+  endif()
   
   # install(FILES "${CMAKE_SOURCE_DIR}/models/fai_xray.onnx"
   #         DESTINATION bin/models)

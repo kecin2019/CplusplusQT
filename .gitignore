@@ -6,3 +6,4 @@ weights
 .vs
 vcpkg_installed
 models
+tests

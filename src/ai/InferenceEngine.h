@@ -5,6 +5,10 @@
 #include <memory>
 #include <vector>
 
+// 前向声明
+class AppConfig;
+class ErrorHandler;
+
 class InferenceEngine
 {
 public:
@@ -34,7 +38,7 @@ public:
     InferenceEngine();
     ~InferenceEngine();
 
-    bool loadModel(const QString &weightsPath, Task taskHint);
+    bool loadModel(const QString &path);
     Result run(const QImage &input, Task taskHint) const;
 
     // MRI分割专用方法
@@ -66,4 +70,6 @@ private:
     bool m_hasObj{false};
 
     QString m_modelPath;
+    int m_detOutputIndex{-1};
+    int m_segOutputIndex{-1};
 };

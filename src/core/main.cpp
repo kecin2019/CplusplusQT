@@ -6,7 +6,7 @@ int main(int argc, char *argv[])
 {
     QApplication app(argc, argv);
     QApplication::setApplicationName("Med YOLO11 Qt");
-    QApplication::setOrganizationName("YourLab");
+    QApplication::setOrganizationName("ASRI");
 
     // 显示任务选择对话框
     TaskSelectionDialog taskDialog;
