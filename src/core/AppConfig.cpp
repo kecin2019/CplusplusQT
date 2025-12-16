@@ -1,7 +1,23 @@
 #include "AppConfig.h"
 #include <QCoreApplication>
+#include <QFile>
 #include <QFileInfo>
 #include <QDir>
+#include <QRegularExpression>
+
+namespace
+{
+QStringList defaultMriClassNames()
+{
+    return {
+        QStringLiteral("Gluteus Medius"),
+        QStringLiteral("Gluteus Minimus"),
+        QStringLiteral("Iliopsoas"),
+        QStringLiteral("Obturator Internus"),
+        QStringLiteral("Piriformis"),
+        QStringLiteral("Tensor Fasciae Latae")};
+}
+}
 
 /**
  * @brief 获取配置管理器的单例实例
@@ -107,7 +123,7 @@ bool AppConfig::saveConfig(const QString &configPath)
  */
 QString AppConfig::getQtInstallPath() const
 {
-    return m_settings->value("Paths/Qt", "QT_INSTALL_PATH").toString();
+    return m_settings->value("Paths/QtPath").toString();
 }
 
 /**
@@ -116,7 +132,7 @@ QString AppConfig::getQtInstallPath() const
  */
 void AppConfig::setQtInstallPath(const QString &path)
 {
-    m_settings->setValue("Paths/Qt", path);
+    m_settings->setValue("Paths/QtPath", path);
 }
 
 /**
@@ -125,7 +141,7 @@ void AppConfig::setQtInstallPath(const QString &path)
  */
 QString AppConfig::getGdcmInstallPath() const
 {
-    return m_settings->value("Paths/GDCM", "GDCM_INSTALL_PATH").toString();
+    return m_settings->value("Paths/GDCMPath").toString();
 }
 
 /**
@@ -134,7 +150,7 @@ QString AppConfig::getGdcmInstallPath() const
  */
 void AppConfig::setGdcmInstallPath(const QString &path)
 {
-    m_settings->setValue("Paths/GDCM", path);
+    m_settings->setValue("Paths/GDCMPath", path);
 }
 
 /**
@@ -143,7 +159,7 @@ void AppConfig::setGdcmInstallPath(const QString &path)
  */
 QString AppConfig::getOnnxRuntimeInstallPath() const
 {
-    return m_settings->value("Paths/ONNXRuntime", "ONNXRUNTIME_INSTALL_PATH").toString();
+    return m_settings->value("Paths/ONNXRuntimePath").toString();
 }
 
 /**
@@ -152,7 +168,7 @@ QString AppConfig::getOnnxRuntimeInstallPath() const
  */
 void AppConfig::setOnnxRuntimeInstallPath(const QString &path)
 {
-    m_settings->setValue("Paths/ONNXRuntime", path);
+    m_settings->setValue("Paths/ONNXRuntimePath", path);
 }
 
 /**
@@ -189,6 +205,28 @@ QString AppConfig::getMriModelPath() const
 void AppConfig::setMriModelPath(const QString &path)
 {
     m_settings->setValue("Models/MRI", path);
+}
+
+QStringList AppConfig::getMriClassNames() const
+{
+    const QString raw = m_settings->value("MRI/ClassNames").toString();
+    if (raw.trimmed().isEmpty())
+        return defaultMriClassNames();
+
+    QStringList names;
+    const QStringList parts = raw.split(QRegularExpression("[,;]"), Qt::SkipEmptyParts);
+    for (const QString &p : parts)
+    {
+        const QString trimmed = p.trimmed();
+        if (!trimmed.isEmpty())
+            names << trimmed;
+    }
+    return names.isEmpty() ? defaultMriClassNames() : names;
+}
+
+void AppConfig::setMriClassNames(const QStringList &names)
+{
+    m_settings->setValue("MRI/ClassNames", names.join(", "));
 }
 
 /**
@@ -233,7 +271,15 @@ void AppConfig::setIoUThreshold(float threshold)
  */
 QString AppConfig::getModelProtectionKey() const
 {
-    return m_settings->value("Security/ModelProtectionKey", "MedYOLO11Qt_Model_Protection_Key_2024").toString();
+    const QString configured = m_settings->value("Security/ModelProtectionKey").toString().trimmed();
+    if (!configured.isEmpty())
+        return configured;
+
+    const QString envKey = QString::fromUtf8(qgetenv("MEDAPP_MODEL_KEY")).trimmed();
+    if (!envKey.isEmpty())
+        return envKey;
+
+    return QStringLiteral("MedYOLO11Qt_Model_Protection_Key_2024");
 }
 
 /**
@@ -243,6 +289,26 @@ QString AppConfig::getModelProtectionKey() const
 void AppConfig::setModelProtectionKey(const QString &key)
 {
     m_settings->setValue("Security/ModelProtectionKey", key);
+}
+
+bool AppConfig::isGpuAccelerationEnabled() const
+{
+    return m_settings->value("Performance/UseGPU", false).toBool();
+}
+
+void AppConfig::setGpuAccelerationEnabled(bool enabled)
+{
+    m_settings->setValue("Performance/UseGPU", enabled);
+}
+
+int AppConfig::gpuDeviceId() const
+{
+    return m_settings->value("Performance/GPUID", 0).toInt();
+}
+
+void AppConfig::setGpuDeviceId(int deviceId)
+{
+    m_settings->setValue("Performance/GPUID", deviceId);
 }
 
 /**

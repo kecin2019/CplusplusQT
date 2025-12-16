@@ -24,14 +24,31 @@ int main(int argc, char *argv[])
 {
     QCoreApplication app(argc, argv);
 
-    if (argc != 3)
+    if (argc < 3 || argc > 4)
     {
-        qDebug() << "Usage: encrypt_model <input.onnx> <output.encrypted>";
+        qDebug() << "Usage: encrypt_model <input.onnx> <output.encrypted> [plain-text-key]";
+        qDebug() << "       (or set MEDAPP_MODEL_KEY environment variable)";
         return 1;
     }
 
     QString inputFile = argv[1];
     QString outputFile = argv[2];
+    QString keyString;
+    if (argc == 4)
+    {
+        keyString = argv[3];
+    }
+    else
+    {
+        keyString = QString::fromUtf8(qgetenv("MEDAPP_MODEL_KEY"));
+    }
+
+    keyString = keyString.trimmed();
+    if (keyString.isEmpty())
+    {
+        qDebug() << "No model key provided. Pass it as the third argument or set MEDAPP_MODEL_KEY.";
+        return 1;
+    }
 
     // 读取原始模型文件
     QFile file(inputFile);
@@ -46,7 +63,7 @@ int main(int argc, char *argv[])
 
     // 使用程序特定的密钥
     QByteArray key = QCryptographicHash::hash(
-        "MedYOLO11Qt_Model_Protection_Key_2024",
+        keyString.toUtf8(),
         QCryptographicHash::Sha256);
 
     // 使用XOR加密（简单但有效）

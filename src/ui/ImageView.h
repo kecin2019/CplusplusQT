@@ -13,6 +13,11 @@ public:
     void clearImage();
     QTransform viewTransform() const { return transform(); }
     void applyViewTransform(const QTransform &t) { setTransform(t); }
+    void setSliceNavigationEnabled(bool enabled);
+    bool sliceNavigationEnabled() const { return m_sliceNavigationEnabled; }
+
+signals:
+    void sliceStepRequested(int steps);
 
 protected:
     void wheelEvent(QWheelEvent *e) override;
@@ -27,4 +32,5 @@ private:
     double m_scale{1.0};
     QPoint m_lastPos;
     bool m_panning{false};
+    bool m_sliceNavigationEnabled{false};
 };

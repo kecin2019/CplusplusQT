@@ -63,6 +63,11 @@ void ImageView::clearImage()
     m_scene->clear();
     m_scale = 1.0;
 }
+
+void ImageView::setSliceNavigationEnabled(bool enabled)
+{
+    m_sliceNavigationEnabled = enabled;
+}
 void ImageView::resetZoom()
 {
     resetTransform();
@@ -71,6 +76,14 @@ void ImageView::resetZoom()
 }
 void ImageView::wheelEvent(QWheelEvent *e)
 {
+    if (m_sliceNavigationEnabled && !(e->modifiers() & Qt::ControlModifier))
+    {
+        int steps = (e->angleDelta().y() > 0) ? -1 : 1;
+        emit sliceStepRequested(steps);
+        e->accept();
+        return;
+    }
+
     const double factor = (e->angleDelta().y() > 0) ? 1.15 : 1.0 / 1.15;
     m_scale *= factor;
     scale(factor, factor);

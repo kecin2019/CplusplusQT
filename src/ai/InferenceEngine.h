@@ -25,6 +25,9 @@ public:
         float x1, y1, x2, y2; // 像素坐标（原图）
         float score;          // 0..1
         int cls;              // 0:CAM, 1:PINCER, 2:MIXED, 3:NORMAL
+        double maskAreaPixels{0.0};
+        double maskAreaMm2{0.0};
+        bool hasMask{false};
     };
 
     struct Result
@@ -39,12 +42,11 @@ public:
     ~InferenceEngine();
 
     bool loadModel(const QString &path);
+    void unload();
+    bool isLoaded() const;
     Result run(const QImage &input, Task taskHint) const;
 
-    // MRI分割专用方法
     bool isSegmentationModel() const;
-    QImage processSegmentation(const QImage &input) const;
-
     void setThresholds(float conf, float iou)
     {
         m_confThr = conf;
@@ -54,6 +56,8 @@ public:
     // 固定 4 类：名字 + 颜色
     static QString className(int cls);
     static QColor classColor(int cls);
+    static QString segmentationClassName(int cls);
+    static QColor segmentationClassColor(int cls);
 
 private:
     struct OrtPack;
@@ -72,4 +76,15 @@ private:
     QString m_modelPath;
     int m_detOutputIndex{-1};
     int m_segOutputIndex{-1};
+
+    // YOLO segmentation prototype information
+    int m_maskChannels{0};
+    int m_maskWidth{0};
+    int m_maskHeight{0};
+    int m_detVectorSize{0};
+
+#ifdef HAVE_ORT
+    Result runYolo(const QImage &input, bool segmentationMode) const;
+#endif
+    bool hasSegmentationSupport() const;
 };

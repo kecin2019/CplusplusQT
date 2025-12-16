@@ -7,9 +7,11 @@
 #include <QMainWindow>
 #include <QMap>
 #include <QStringList>
+#include <QVector>
 
 #include "InferenceEngine.h"
 #include "TaskSelectionDialog.h"
+#include "medical/DicomUtils.h"
 
 class QAction;
 class QLabel;
@@ -18,6 +20,7 @@ class QPlainTextEdit;
 class QProgressBar;
 class QProgressDialog;
 class QTabWidget;
+class QTableWidget;
 class ImageView;
 class MetaTable;
 class QListWidget;
@@ -32,6 +35,7 @@ public:
     void setTaskType(TaskSelectionDialog::TaskType taskType);
     QMap<QString, QImage> m_cacheImg;
     QMap<QString, std::vector<InferenceEngine::Detection>> m_cacheDets;
+    QMap<QString, QImage> m_cacheSegMasks;
 
 private slots:
     void openImage();
@@ -61,7 +65,7 @@ private:
     void updateTaskUi(TaskSelectionDialog::TaskType taskType);
     void updateStatusSummary();
     void setInputImage(const QImage &img);
-    void setOutputImage(const QImage &img);
+    void setOutputImage(const QImage &img, bool focusOutput = true);
     void updateMetaTable(const QMap<QString, QString> &meta);
     void loadPath(const QString &path);
     bool promptForModelFile(QString &path, const QString &title) const;
@@ -72,6 +76,28 @@ private:
     void handleBatchInferenceFinished();
     void setBusyState(bool busy, const QString &message, int maximum = 0);
     void updateProgressValue(int value, int maximum);
+    void updateSliceNavigationState();
+    void updateSliceIndicator();
+    void positionSliceIndicator();
+    void handleSliceStep(int steps);
+    void displayDicomSlice(int index);
+    void setupDicomSeries(const QString &path, const DicomUtils::SliceInfo &info);
+    void clearDicomSeries();
+    void postProcessSegmentationResult(InferenceEngine::Result &result);
+    double currentPixelArea() const;
+    QString segmentationLabel(int cls) const;
+    void annotateSegmentationImage(QImage &img,
+                                   const std::vector<InferenceEngine::Detection> &dets,
+                                   double areaFactor) const;
+    void annotateCachedSegmentationIfNeeded(const QString &path);
+    void updateSegmentationStats(const std::vector<InferenceEngine::Detection> &dets);
+    void clearSegmentationStats();
+    bool isModelReadyForTask(TaskSelectionDialog::TaskType task) const;
+    bool ensureModelReadyForCurrentTask(const QString &contextTitle);
+    void unloadModelForTask(TaskSelectionDialog::TaskType task);
+    InferenceEngine::Task inferenceTaskForMode(TaskSelectionDialog::TaskType task) const;
+    QString taskDisplayName(TaskSelectionDialog::TaskType task) const;
+    void resizeEvent(QResizeEvent *event) override;
 
     QTabWidget *m_viewTabs{nullptr};
     ImageView *m_inputView{nullptr};
@@ -84,6 +110,8 @@ private:
     QDockWidget *m_metadataDock{nullptr};
     QDockWidget *m_batchDock{nullptr};
     QDockWidget *m_logDock{nullptr};
+    QDockWidget *m_segStatsDock{nullptr};
+    QTableWidget *m_segStats{nullptr};
 
     QLabel *m_statusMode{nullptr};
     QLabel *m_statusModel{nullptr};
@@ -117,6 +145,19 @@ private:
     QProgressDialog *m_progressDialog{nullptr};
     QString m_pendingInferencePath;
     InferenceEngine::Task m_pendingTask{InferenceEngine::Task::Auto};
+    InferenceEngine::Task m_lastBatchTask{InferenceEngine::Task::Auto};
+    QLabel *m_sliceIndicator{nullptr};
+    struct DicomSliceEntry
+    {
+        QString path;
+        int instanceNumber{0};
+        double sliceLocation{0.0};
+    };
+    QVector<DicomSliceEntry> m_dicomSeries;
+    int m_currentSliceIndex{-1};
+    double m_spacingX{1.0};
+    double m_spacingY{1.0};
+    QString m_currentSeriesUid;
 
     struct BatchItem
     {

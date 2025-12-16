@@ -2,6 +2,7 @@
 #define APPCONFIG_H
 
 #include <QString>
+#include <QStringList>
 #include <QSettings>
 
 /**
@@ -55,6 +56,9 @@ public:
     QString getMriModelPath() const;
     void setMriModelPath(const QString &path);
 
+    QStringList getMriClassNames() const;
+    void setMriClassNames(const QStringList &names);
+
     // 推理参数配置
     float getConfidenceThreshold() const;
     void setConfidenceThreshold(float threshold);
@@ -65,6 +69,12 @@ public:
     // 模型保护相关配置
     QString getModelProtectionKey() const;
     void setModelProtectionKey(const QString &key);
+
+    bool isGpuAccelerationEnabled() const;
+    void setGpuAccelerationEnabled(bool enabled);
+
+    int gpuDeviceId() const;
+    void setGpuDeviceId(int deviceId);
 
     // 调试模式配置
     bool isDebugModeEnabled() const;

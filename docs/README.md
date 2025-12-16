@@ -147,7 +147,8 @@ MedYOLO11Qt/
 1. **选择模式**：选择 "MRI分割" 模式
 2. **加载 MRI**：打开 MRI 图像文件
 3. **执行分割**：点击运行推理
-4. **查看分割**：器官分割结果可视化显示
+4. **查看分割**：器官分割结果可视化显示，标签中包含目标肌肉名称与面积
+5. **切层导航**：鼠标滚轮即可在同一序列中上下切层（按住 `Ctrl` + 滚轮继续缩放），右下角实时显示当前切片编号
 
 ### 批量处理
 1. **打开文件夹**：选择包含医学图像的文件夹
@@ -202,18 +203,33 @@ QtPath=E:/tools/Qt/6.9.2/msvc2022_64
 GDCMPath=E:/tools/GDCM-3.2.0-Windows-x86_64
 ONNXRuntimePath=E:/tools/onnxruntime-win-x64-1.22.1
 
+[Models]
+FAI=./models/encrypted/fai_xray.encrypted
+MRI=./models/encrypted/mri_segmentation.encrypted
+
+[MRI]
+ClassNames=Gluteus Medius, Gluteus Minimus, Iliopsoas, Obturator Internus, Piriformis, Tensor Fasciae Latae
+
 [Inference]
 ConfidenceThreshold=0.25      # 检测置信度
 IoUThreshold=0.45            # NMS 阈值
 
 [Performance]
 UseGPU=false                 # GPU 加速开关
+GPUID=0                      # CUDA 设备编号
 BatchSize=1                  # 批处理大小
+
+[Security]
+ModelProtectionKey=          # 留空可通过 MEDAPP_MODEL_KEY 环境变量提供
 
 [UI]
 Theme=Light                  # 界面主题
 Language=Chinese             # 界面语言
 ```
+
+> 🔐 **模型密钥**：部署环境需提供 `Security/ModelProtectionKey` 或设置 `MEDAPP_MODEL_KEY`，否则无法加载加密模型。  
+> ⚡ **GPU 加速**：`Performance/UseGPU=true` 时自动尝试启用 CUDA，并使用 `GPUID` 指定设备，失败会自动回退到 CPU。  
+> 🧠 **肌肉命名**：如需匹配训练模型中的肌肉类别，可在 `[MRI]` 的 `ClassNames` 中自定义顺序与名称。
 
 ---
 

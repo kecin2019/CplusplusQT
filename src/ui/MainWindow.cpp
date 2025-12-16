@@ -35,6 +35,13 @@
 #include <QCoreApplication>
 #include <QPalette>
 #include <QStyleFactory>
+#include <QTableWidget>
+#include <QTableWidgetItem>
+#include <QHeaderView>
+#include <QAbstractItemView>
+#include <cmath>
+#include <algorithm>
+#include <QResizeEvent>
 
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
 {
@@ -70,6 +77,7 @@ void MainWindow::setTaskType(TaskSelectionDialog::TaskType taskType)
     m_currentTask = taskType;
     updateTaskUi(taskType);
     refreshActionStates();
+    updateSliceNavigationState();
 }
 
 void MainWindow::setupUi()
@@ -149,6 +157,14 @@ void MainWindow::createCentralViews()
     m_viewTabs->addTab(m_inputView, tr("Input"));
     m_viewTabs->addTab(m_outputView, tr("Output"));
     setCentralWidget(m_viewTabs);
+
+    connect(m_inputView, &ImageView::sliceStepRequested, this, &MainWindow::handleSliceStep);
+    connect(m_outputView, &ImageView::sliceStepRequested, this, &MainWindow::handleSliceStep);
+
+    m_sliceIndicator = new QLabel(m_viewTabs);
+    m_sliceIndicator->setObjectName("SliceIndicator");
+    m_sliceIndicator->setStyleSheet("QLabel { background-color: rgba(0, 0, 0, 160); color: #ffffff; padding: 4px 10px; border-radius: 6px; }");
+    m_sliceIndicator->setVisible(false);
 }
 
 void MainWindow::createDockWidgets()
@@ -222,6 +238,30 @@ void MainWindow::createDockWidgets()
             {
         if (m_actToggleLog && m_actToggleLog->isChecked() != visible)
             m_actToggleLog->setChecked(visible); });
+
+    // Segmentation stats dock
+    m_segStatsDock = new QDockWidget(tr("Segmentation Metrics"), this);
+    m_segStatsDock->setObjectName("SegStatsDock");
+    m_segStatsDock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
+    auto *statsContainer = new QWidget(m_segStatsDock);
+    auto *statsLayout = new QVBoxLayout(statsContainer);
+    statsLayout->setContentsMargins(12, 12, 12, 12);
+    statsLayout->setSpacing(8);
+    auto *statsLabel = new QLabel(tr("Muscle Areas"), statsContainer);
+    m_segStats = new QTableWidget(0, 3, statsContainer);
+    m_segStats->setHorizontalHeaderLabels({tr("Muscle"), tr("Area (mm²)"), tr("Area (cm²)")});
+    m_segStats->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    m_segStats->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    m_segStats->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    m_segStats->verticalHeader()->setVisible(false);
+    m_segStats->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_segStats->setSelectionBehavior(QAbstractItemView::SelectRows);
+    statsLayout->addWidget(statsLabel);
+    statsLayout->addWidget(m_segStats, 1);
+    statsContainer->setLayout(statsLayout);
+    m_segStatsDock->setWidget(statsContainer);
+    addDockWidget(Qt::RightDockWidgetArea, m_segStatsDock);
+    m_segStatsDock->hide();
 }
 
 void MainWindow::createStatusBar()
@@ -330,9 +370,12 @@ void MainWindow::onListActivated()
     {
         m_output = m_cacheImg.value(sel);
         m_lastDets = m_cacheDets.value(sel);
-        setOutputImage(m_output);
+        m_segmentationMask = m_cacheSegMasks.value(sel);
+        const bool focus = (m_currentTask != TaskSelectionDialog::MRI_Segmentation);
+        setOutputImage(m_output, focus);
+        annotateCachedSegmentationIfNeeded(sel);
     }
-    else if (m_modelReady || m_mriModelReady)
+    else if (m_currentTask == TaskSelectionDialog::FAI_XRay && m_modelReady)
     {
         // 自动对当前文件推理一次
         runInference();
@@ -360,20 +403,20 @@ void MainWindow::runInference()
         return;
     }
 
-    if (!m_modelReady && !m_mriModelReady)
-    {
-        QMessageBox::information(this, "Run Inference", "Please load an ONNX model first.");
+    if (!ensureModelReadyForCurrentTask(tr("Run Inference")))
         return;
-    }
 
+    const InferenceEngine::Task task = inferenceTaskForMode(m_currentTask);
     m_isInferenceRunning = true;
     m_pendingInferencePath = m_currentPath;
-    m_pendingTask = m_modelReady ? InferenceEngine::Task::FAI_XRay : InferenceEngine::Task::HipMRI_Seg;
+    m_pendingTask = task;
 
-    setBusyState(true, "Running inference...");
+    const QString busyText = (task == InferenceEngine::Task::HipMRI_Seg)
+                                 ? tr("Running MRI segmentation...")
+                                 : tr("Running FAI detection...");
+    setBusyState(true, busyText);
 
     const QImage inputCopy = m_input;
-    const InferenceEngine::Task task = m_pendingTask;
 
     auto future = QtConcurrent::run([this, inputCopy, task]()
                                     {
@@ -391,11 +434,8 @@ void MainWindow::runBatchInference()
         return;
     }
 
-    if (!m_modelReady && !m_mriModelReady)
-    {
-        QMessageBox::information(this, "Batch Export", "Please load an ONNX model first.");
+    if (!ensureModelReadyForCurrentTask(tr("Batch Infer")))
         return;
-    }
 
     if (!m_list || m_list->count() == 0)
     {
@@ -410,9 +450,13 @@ void MainWindow::runBatchInference()
 
     const int total = paths.size();
     m_isBatchRunning = true;
-    setBusyState(true, "Running batch inference...", total);
+    const InferenceEngine::Task task = inferenceTaskForMode(m_currentTask);
+    m_lastBatchTask = task;
+    const QString busyText = (task == InferenceEngine::Task::HipMRI_Seg)
+                                 ? tr("Running MRI batch segmentation...")
+                                 : tr("Running batch detection...");
+    setBusyState(true, busyText, total);
 
-    const InferenceEngine::Task task = m_modelReady ? InferenceEngine::Task::FAI_XRay : InferenceEngine::Task::HipMRI_Seg;
     QPointer<MainWindow> guard(this);
 
     auto future = QtConcurrent::run([this, guard, task, paths = std::move(paths)]() -> std::vector<BatchItem>
@@ -467,10 +511,14 @@ void MainWindow::runBatchInference()
             ++index;
             if (guard)
             {
-                QMetaObject::invokeMethod(guard, [guard, index, totalCount]() {
-                    if (guard)
-guard->updateProgressValue(index, totalCount);
-                }, Qt::QueuedConnection);
+                QMetaObject::invokeMethod(
+                    guard,
+                    [guard, index, totalCount]()
+                    {
+                        if (guard)
+                            guard->updateProgressValue(index, totalCount);
+                    },
+                    Qt::QueuedConnection);
             }
         }
         return results; });
@@ -481,7 +529,7 @@ guard->updateProgressValue(index, totalCount);
 void MainWindow::refreshActionStates()
 {
     const bool busy = m_isInferenceRunning || m_isBatchRunning;
-    const bool hasModel = m_modelReady || m_mriModelReady;
+    const bool hasModel = isModelReadyForTask(m_currentTask);
 
     if (m_actRun)
         m_actRun->setEnabled(hasModel && !busy);
@@ -516,6 +564,9 @@ void MainWindow::updateTaskUi(TaskSelectionDialog::TaskType taskType)
     }
     setWindowTitle(isSegmentation ? tr("Med YOLO11 Qt - MRI Segmentation")
                                   : tr("Med YOLO11 Qt - FAI X-Ray Detection"));
+    if (m_segStatsDock)
+        m_segStatsDock->setVisible(isSegmentation);
+    clearSegmentationStats();
     updateStatusSummary();
 }
 
@@ -523,19 +574,18 @@ void MainWindow::updateStatusSummary()
 {
     if (m_statusMode)
     {
-        const QString modeText = (m_currentTask == TaskSelectionDialog::MRI_Segmentation)
-                                     ? tr("Mode: MRI Segmentation")
-                                     : tr("Mode: FAI X-Ray");
+        const QString modeText = tr("Mode: %1").arg(taskDisplayName(m_currentTask));
         m_statusMode->setText(modeText);
     }
 
     if (m_statusModel)
     {
-        QString info;
-        if (m_currentTask == TaskSelectionDialog::MRI_Segmentation)
-            info = m_mriModelReady ? tr("MRI Model: Ready") : tr("MRI Model: Not loaded");
-        else
-            info = m_modelReady ? tr("FAI Model: Ready") : tr("FAI Model: Not loaded");
+        const bool ready = isModelReadyForTask(m_currentTask);
+        const QString modelLabel = (m_currentTask == TaskSelectionDialog::MRI_Segmentation)
+                                       ? tr("MRI Model")
+                                       : tr("FAI Model");
+        const QString info = ready ? tr("%1: Ready").arg(modelLabel)
+                                   : tr("%1: Not loaded").arg(modelLabel);
         m_statusModel->setText(info);
     }
 }
@@ -664,11 +714,20 @@ void MainWindow::handleSingleInferenceFinished()
     }
 
     InferenceEngine::Result result = m_singleWatcher.result();
+    const bool wasSegmentation = (m_pendingTask == InferenceEngine::Task::HipMRI_Seg);
+    if (wasSegmentation)
+        postProcessSegmentationResult(result);
+    else
+        clearSegmentationStats();
 
     if (!m_pendingInferencePath.isEmpty())
     {
         m_cacheImg[m_pendingInferencePath] = result.outputImage;
         m_cacheDets[m_pendingInferencePath] = result.dets;
+        if (!result.segmentationMask.isNull())
+            m_cacheSegMasks[m_pendingInferencePath] = result.segmentationMask;
+        else
+            m_cacheSegMasks.remove(m_pendingInferencePath);
     }
     m_pendingInferencePath.clear();
 
@@ -677,7 +736,10 @@ void MainWindow::handleSingleInferenceFinished()
     m_segmentationMask = result.segmentationMask;
 
     if (!result.outputImage.isNull())
-        setOutputImage(result.outputImage);
+    {
+        const bool focusOutput = (m_pendingTask != InferenceEngine::Task::HipMRI_Seg);
+        setOutputImage(result.outputImage, focusOutput);
+    }
     else
         m_outputView->clearImage();
 
@@ -702,7 +764,8 @@ void MainWindow::handleBatchInferenceFinished()
     int ok = 0;
     int fail = 0;
 
-    for (const auto &item : results)
+    const bool segTask = (m_lastBatchTask == InferenceEngine::Task::HipMRI_Seg);
+    for (auto &item : results)
     {
         if (!item.success)
         {
@@ -712,15 +775,23 @@ void MainWindow::handleBatchInferenceFinished()
         }
 
         ++ok;
+        if (segTask && item.path == m_currentPath)
+            postProcessSegmentationResult(item.result);
+
         m_cacheImg[item.path] = item.result.outputImage;
         m_cacheDets[item.path] = item.result.dets;
+        if (!item.result.segmentationMask.isNull())
+            m_cacheSegMasks[item.path] = item.result.segmentationMask;
+        else
+            m_cacheSegMasks.remove(item.path);
 
         if (item.path == m_currentPath)
         {
             m_output = item.result.outputImage;
             m_lastDets = item.result.dets;
             m_segmentationMask = item.result.segmentationMask;
-            setOutputImage(item.result.outputImage);
+            const bool focus = !segTask;
+            setOutputImage(item.result.outputImage, focus);
             statusBar()->showMessage(item.result.summary, 5000);
         }
     }
@@ -729,6 +800,10 @@ void MainWindow::handleBatchInferenceFinished()
 
     QMessageBox::information(this, "Batch Infer",
                              QString("Done. Success: %1, Failed: %2").arg(ok).arg(fail));
+
+    if (!segTask)
+        clearSegmentationStats();
+    m_lastBatchTask = InferenceEngine::Task::Auto;
 }
 
 void MainWindow::loadFAIModel()
@@ -792,6 +867,7 @@ void MainWindow::loadFAIModel()
         AppConfig::instance().setFaiModelPath(modelPath);
         AppConfig::instance().saveConfig();
         refreshActionStates();
+        updateStatusSummary();
 
         log(tr("FAI model loaded: %1").arg(modelPath));
     }
@@ -849,6 +925,7 @@ void MainWindow::loadMRIModel()
         AppConfig::instance().setMriModelPath(modelPath);
         AppConfig::instance().saveConfig();
         refreshActionStates();
+        updateStatusSummary();
 
         log(tr("MRI model loaded: %1").arg(modelPath));
     }
@@ -862,12 +939,25 @@ void MainWindow::loadMRIModel()
 
 void MainWindow::switchTask()
 {
+    if (m_isInferenceRunning || m_isBatchRunning)
+    {
+        QMessageBox::information(this,
+                                 tr("Switch Task"),
+                                 tr("Inference is still running. Please wait until it finishes before switching tasks."));
+        return;
+    }
+
     TaskSelectionDialog dialog;
     if (dialog.exec() == QDialog::Accepted)
     {
-        setTaskType(dialog.selectedTask());
+        const auto newTask = dialog.selectedTask();
+        if (newTask == m_currentTask)
+            return;
+
+        unloadModelForTask(m_currentTask);
+        setTaskType(newTask);
         clearAll();
-        log(tr("Task switched"));
+        log(tr("Task switched to %1").arg(taskDisplayName(newTask)));
     }
 }
 
@@ -886,6 +976,8 @@ void MainWindow::clearAll()
     if (m_batchFilter)
         m_batchFilter->clear();
     m_segmentationMask = QImage();
+    clearDicomSeries();
+    clearSegmentationStats();
     statusBar()->showMessage(tr("Workspace cleared"));
     appendLog(tr("Workspace cleared"));
     refreshActionStates();
@@ -911,15 +1003,20 @@ void MainWindow::log(const QString &s)
 void MainWindow::setInputImage(const QImage &img)
 {
     m_input = img;
-    m_inputView->setImage(img, true);
-    m_viewTabs->setCurrentWidget(m_inputView);
+    if (m_inputView)
+        m_inputView->setImage(img, true);
+    if (m_viewTabs && m_inputView)
+        m_viewTabs->setCurrentWidget(m_inputView);
 }
-void MainWindow::setOutputImage(const QImage &img)
+void MainWindow::setOutputImage(const QImage &img, bool focusOutput)
 {
-    // ���ͼ�������� fit��ֱ�ӱ���������ͼ��ͬ����
+    if (!m_outputView)
+        return;
     m_outputView->setImage(img, false);
-    m_outputView->setTransform(m_inputView->transform());
-    m_viewTabs->setCurrentWidget(m_outputView);
+    if (m_inputView)
+        m_outputView->setTransform(m_inputView->transform());
+    if (focusOutput && m_viewTabs)
+        m_viewTabs->setCurrentWidget(m_outputView);
     refreshActionStates();
 }
 void MainWindow::updateMetaTable(const QMap<QString, QString> &meta) { m_meta->setData(meta); }
@@ -935,6 +1032,7 @@ void MainWindow::loadPath(const QString &path)
     {
         if (isImageFile(path))
         {
+            clearDicomSeries();
             QImage img(path);
             if (img.isNull())
             {
@@ -956,9 +1054,11 @@ void MainWindow::loadPath(const QString &path)
         {
             QImage img;
             QMap<QString, QString> meta;
+            DicomUtils::SliceInfo sliceInfo;
 #ifdef HAVE_GDCM
-            if (!DicomUtils::loadDicomToQImage(path, img, &meta))
+            if (!DicomUtils::loadDicomToQImage(path, img, &meta, &sliceInfo))
             {
+                clearDicomSeries();
                 QString errorMsg = QString("Failed to load DICOM: %1").arg(path);
                 LOG_ERROR(errorMsg, "DicomLoader", 3002);
                 QMessageBox::warning(this, "Open DICOM", errorMsg);
@@ -968,12 +1068,16 @@ void MainWindow::loadPath(const QString &path)
             QString infoMsg = "Built without GDCM. Reconfigure with -DUSE_GDCM=ON.";
             LOG_INFO(infoMsg, "DicomLoader");
             QMessageBox::information(this, "DICOM disabled", infoMsg);
+            clearDicomSeries();
             return;
 #endif
             m_currentPath = path;
             setInputImage(img);
             updateMetaTable(meta);
             log(QString("Loaded DICOM: %1").arg(path));
+            setupDicomSeries(path, sliceInfo);
+            if (m_currentTask == TaskSelectionDialog::MRI_Segmentation && m_mriModelReady)
+                statusBar()->showMessage(tr("请选择切层后点击 Run Inference 执行分割"), 5000);
         }
         else
         {
@@ -994,7 +1098,9 @@ void MainWindow::exportCurrent()
 {
     try
     {
-        if (m_output.isNull() || m_lastDets.empty())
+        const bool hasDetections = !m_lastDets.empty();
+        const bool hasSegMask = !m_segmentationMask.isNull();
+        if (m_output.isNull() || (!hasDetections && !hasSegMask))
         {
             QString errorMsg = "No inference result to export.";
             LOG_WARNING(errorMsg, "Export", 4001);
@@ -1016,16 +1122,35 @@ void MainWindow::exportCurrent()
             QMessageBox::warning(this, "Export", errorMsg);
             return;
         }
-        QString outJson = QFileInfo(outImg).absolutePath() + "/" +
-                          QFileInfo(outImg).completeBaseName() + ".json";
-        if (!saveJson(outJson, m_currentPath, m_input.size(), m_lastDets))
+        if (hasDetections)
         {
-            QString errorMsg = QString("Failed to save JSON: %1").arg(outJson);
-            LOG_ERROR(errorMsg, "Export", 4003);
-            QMessageBox::warning(this, "Export", errorMsg);
-            return;
+            QString outJson = QFileInfo(outImg).absolutePath() + "/" +
+                              QFileInfo(outImg).completeBaseName() + ".json";
+            if (!saveJson(outJson, m_currentPath, m_input.size(), m_lastDets))
+            {
+                QString errorMsg = QString("Failed to save JSON: %1").arg(outJson);
+                LOG_ERROR(errorMsg, "Export", 4003);
+                QMessageBox::warning(this, "Export", errorMsg);
+                return;
+            }
         }
-        statusBar()->showMessage("Exported: " + outImg + " & " + outJson, 5000);
+        if (hasSegMask)
+        {
+            QString maskPath = QFileInfo(outImg).absolutePath() + "/" +
+                               QFileInfo(outImg).completeBaseName() + "_mask.png";
+            if (!m_segmentationMask.save(maskPath))
+            {
+                QString errorMsg = QString("Failed to save mask: %1").arg(maskPath);
+                LOG_ERROR(errorMsg, "Export", 4005);
+                QMessageBox::warning(this, "Export", errorMsg);
+                return;
+            }
+            statusBar()->showMessage("Exported: " + outImg + (hasDetections ? " & JSON & mask" : " & mask"), 5000);
+        }
+        else
+        {
+            statusBar()->showMessage("Exported: " + outImg + (hasDetections ? " & JSON" : ""), 5000);
+        }
     }
     catch (const std::exception &e)
     {
@@ -1047,19 +1172,15 @@ void MainWindow::exportBatch()
             return;
         }
 
-        if (!m_modelReady && !m_mriModelReady)
-        {
-            QString errorMsg = "Please load an ONNX model first.";
-            LOG_WARNING(errorMsg, "BatchExport", 4006);
-            QMessageBox::information(this, "Batch Infer", errorMsg);
+        if (!ensureModelReadyForCurrentTask(tr("Batch Export")))
             return;
-        }
 
         QString outDir = QFileDialog::getExistingDirectory(this, "Select Output Folder");
         if (outDir.isEmpty())
             return;
 
         int ok = 0, fail = 0;
+        const InferenceEngine::Task task = inferenceTaskForMode(m_currentTask);
         for (int i = 0; i < m_list->count(); ++i)
         {
             QString path = m_list->item(i)->text();
@@ -1094,24 +1215,27 @@ void MainWindow::exportBatch()
 
             auto itI = m_cacheImg.find(path);
             auto itD = m_cacheDets.find(path);
+            auto itS = m_cacheSegMasks.find(path);
             InferenceEngine::Result res;
             if (itI != m_cacheImg.end() && itD != m_cacheDets.end())
             {
                 res.outputImage = itI.value();
                 res.dets = itD.value();
+                if (itS != m_cacheSegMasks.end())
+                    res.segmentationMask = itS.value();
             }
             else
             {
-                if (m_modelReady)
-                {
-                    res = m_engine.run(in, InferenceEngine::Task::FAI_XRay);
-                }
-                else if (m_mriModelReady)
-                {
-                    res = m_mriEngine.run(in, InferenceEngine::Task::HipMRI_Seg);
-                }
+                if (task == InferenceEngine::Task::HipMRI_Seg)
+                    res = m_mriEngine.run(in, task);
+                else
+                    res = m_engine.run(in, task);
                 m_cacheImg[path] = res.outputImage;
                 m_cacheDets[path] = res.dets;
+                if (!res.segmentationMask.isNull())
+                    m_cacheSegMasks[path] = res.segmentationMask;
+                else
+                    m_cacheSegMasks.remove(path);
             }
 
             QString stem = QFileInfo(path).completeBaseName();
@@ -1123,10 +1247,24 @@ void MainWindow::exportBatch()
                 ++fail;
                 continue;
             }
-            if (!saveJson(outJs, path, in.size(), res.dets))
+            const bool hasDetections = !res.dets.empty();
+            const bool hasSegMask = !res.segmentationMask.isNull();
+            if (hasDetections)
             {
-                ++fail;
-                continue;
+                if (!saveJson(outJs, path, in.size(), res.dets))
+                {
+                    ++fail;
+                    continue;
+                }
+            }
+            if (hasSegMask)
+            {
+                QString maskPath = outDir + "/" + stem + "_mask.png";
+                if (!res.segmentationMask.save(maskPath))
+                {
+                    ++fail;
+                    continue;
+                }
             }
             ++ok;
         }
@@ -1179,4 +1317,409 @@ bool MainWindow::saveJson(const QString &jsonPath,
     f.write(doc.toJson(QJsonDocument::Indented));
     f.close();
     return true;
+}
+
+void MainWindow::handleSliceStep(int steps)
+{
+    if (steps == 0 || m_dicomSeries.isEmpty())
+        return;
+    const int maxIndex = std::max(0, static_cast<int>(m_dicomSeries.size()) - 1);
+    int newIndex = std::clamp(m_currentSliceIndex + steps, 0, maxIndex);
+    if (newIndex == m_currentSliceIndex)
+        return;
+    displayDicomSlice(newIndex);
+}
+
+void MainWindow::displayDicomSlice(int index)
+{
+    if (index < 0 || index >= m_dicomSeries.size())
+        return;
+
+    QImage img;
+    QMap<QString, QString> meta;
+    DicomUtils::SliceInfo info;
+#ifdef HAVE_GDCM
+    if (!DicomUtils::loadDicomToQImage(m_dicomSeries[index].path, img, &meta, &info))
+    {
+        statusBar()->showMessage(tr("Failed to load slice: %1").arg(m_dicomSeries[index].path), 5000);
+        return;
+    }
+#else
+    Q_UNUSED(info);
+    statusBar()->showMessage(tr("Built without GDCM support"), 5000);
+    return;
+#endif
+
+    if (info.spacingX > 0)
+        m_spacingX = info.spacingX;
+    if (info.spacingY > 0)
+        m_spacingY = info.spacingY;
+    if (!info.seriesInstanceUID.isEmpty())
+        m_currentSeriesUid = info.seriesInstanceUID;
+
+    m_currentSliceIndex = index;
+    m_currentPath = m_dicomSeries[index].path;
+
+    const bool hadImage = (m_inputView && !m_input.isNull());
+    QTransform previousTransform = m_inputView ? m_inputView->viewTransform() : QTransform();
+    setInputImage(img);
+    if (hadImage && m_inputView)
+        m_inputView->applyViewTransform(previousTransform);
+    updateMetaTable(meta);
+    updateSliceIndicator();
+
+    if (m_cacheImg.contains(m_currentPath))
+    {
+        m_output = m_cacheImg.value(m_currentPath);
+        m_lastDets = m_cacheDets.value(m_currentPath);
+        m_segmentationMask = m_cacheSegMasks.value(m_currentPath);
+        if (!m_output.isNull())
+        {
+            const bool focus = (m_currentTask != TaskSelectionDialog::MRI_Segmentation);
+            setOutputImage(m_output, focus);
+        }
+        annotateCachedSegmentationIfNeeded(m_currentPath);
+    }
+    else
+    {
+        m_output = QImage();
+        m_segmentationMask = QImage();
+        if (m_outputView)
+            m_outputView->clearImage();
+        clearSegmentationStats();
+        if (m_currentTask == TaskSelectionDialog::MRI_Segmentation && m_mriModelReady)
+            statusBar()->showMessage(tr("请选择切层后点击 Run Inference 执行分割"), 5000);
+        m_lastDets.clear();
+    }
+}
+
+void MainWindow::setupDicomSeries(const QString &path, const DicomUtils::SliceInfo &info)
+{
+    if (info.spacingX > 0)
+        m_spacingX = info.spacingX;
+    if (info.spacingY > 0)
+        m_spacingY = info.spacingY;
+    m_currentSeriesUid = info.seriesInstanceUID;
+    m_currentSliceIndex = -1;
+    m_dicomSeries.clear();
+
+#ifdef HAVE_GDCM
+    if (!m_currentSeriesUid.isEmpty())
+    {
+        const QFileInfo fi(path);
+        QDir dir = fi.dir();
+        QStringList files = dir.entryList(QStringList() << "*.dcm", QDir::Files);
+        QVector<DicomSliceEntry> entries;
+        entries.reserve(files.size());
+        for (const QString &file : files)
+        {
+            const QString absolutePath = dir.absoluteFilePath(file);
+            DicomUtils::SliceInfo meta;
+            if (!DicomUtils::probeSliceInfo(absolutePath, meta))
+                continue;
+            if (!meta.seriesInstanceUID.isEmpty() && meta.seriesInstanceUID != m_currentSeriesUid)
+                continue;
+            entries.push_back({absolutePath, meta.instanceNumber, meta.sliceLocation});
+        }
+        if (!entries.isEmpty())
+        {
+            std::sort(entries.begin(), entries.end(), [](const DicomSliceEntry &a, const DicomSliceEntry &b)
+                      {
+                if (a.instanceNumber != b.instanceNumber)
+                    return a.instanceNumber < b.instanceNumber;
+                return a.sliceLocation < b.sliceLocation; });
+            m_dicomSeries = entries;
+        }
+    }
+#endif
+
+    if (m_dicomSeries.isEmpty())
+        m_dicomSeries.append({path, info.instanceNumber, info.sliceLocation});
+
+    for (int i = 0; i < m_dicomSeries.size(); ++i)
+    {
+        if (m_dicomSeries[i].path == path)
+        {
+            m_currentSliceIndex = i;
+            break;
+        }
+    }
+    if (m_currentSliceIndex < 0)
+        m_currentSliceIndex = 0;
+
+    updateSliceNavigationState();
+    updateSliceIndicator();
+}
+
+void MainWindow::clearDicomSeries()
+{
+    m_dicomSeries.clear();
+    m_currentSliceIndex = -1;
+    m_spacingX = 1.0;
+    m_spacingY = 1.0;
+    m_currentSeriesUid.clear();
+    if (m_sliceIndicator)
+        m_sliceIndicator->hide();
+    updateSliceNavigationState();
+}
+
+void MainWindow::updateSliceNavigationState()
+{
+    const bool enable = (m_dicomSeries.size() > 1) && (m_currentTask == TaskSelectionDialog::MRI_Segmentation);
+    if (m_inputView)
+        m_inputView->setSliceNavigationEnabled(enable);
+    if (m_outputView)
+        m_outputView->setSliceNavigationEnabled(enable);
+    if (enable)
+        updateSliceIndicator();
+    else if (m_sliceIndicator)
+        m_sliceIndicator->hide();
+}
+
+void MainWindow::updateSliceIndicator()
+{
+    if (!m_sliceIndicator)
+        return;
+    if (m_dicomSeries.size() <= 1 || m_currentSliceIndex < 0 || m_currentTask != TaskSelectionDialog::MRI_Segmentation)
+    {
+        m_sliceIndicator->hide();
+        return;
+    }
+    m_sliceIndicator->setText(tr("Slice %1 / %2").arg(m_currentSliceIndex + 1).arg(m_dicomSeries.size()));
+    m_sliceIndicator->adjustSize();
+    m_sliceIndicator->show();
+    positionSliceIndicator();
+}
+
+void MainWindow::positionSliceIndicator()
+{
+    if (!m_sliceIndicator || !m_sliceIndicator->isVisible() || !m_viewTabs)
+        return;
+    const int margin = 16;
+    const QSize size = m_sliceIndicator->size();
+    int x = m_viewTabs->width() - size.width() - margin;
+    int y = m_viewTabs->height() - size.height() - margin;
+    if (x < margin)
+        x = margin;
+    if (y < margin)
+        y = margin;
+    m_sliceIndicator->move(x, y);
+}
+
+double MainWindow::currentPixelArea() const
+{
+    const double sx = (m_spacingX > 0.0) ? m_spacingX : 1.0;
+    const double sy = (m_spacingY > 0.0) ? m_spacingY : 1.0;
+    return sx * sy;
+}
+
+QString MainWindow::segmentationLabel(int cls) const
+{
+    return InferenceEngine::segmentationClassName(cls);
+}
+
+void MainWindow::annotateSegmentationImage(QImage &img,
+                                           const std::vector<InferenceEngine::Detection> &dets,
+                                           double areaFactor) const
+{
+    if (img.isNull())
+        return;
+
+    QPainter painter(&img);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setRenderHint(QPainter::TextAntialiasing);
+
+    for (const auto &det : dets)
+    {
+        if (!det.hasMask || det.maskAreaPixels <= 0)
+            continue;
+
+        const QString text = segmentationLabel(det.cls);
+        QRectF rect(det.x1, det.y1, det.x2 - det.x1, det.y2 - det.y1);
+        painter.setPen(QPen(InferenceEngine::segmentationClassColor(det.cls), 2.2));
+        painter.drawRect(rect);
+
+        painter.save();
+        QFont font = painter.font();
+        font.setPointSize(7);
+        font.setBold(true);
+        painter.setFont(font);
+        QFontMetrics fm(font);
+        QSize labelSize(fm.horizontalAdvance(text) + 12, fm.height() + 6);
+        QRect labelRect(rect.left(), std::max(0.0, rect.top() - labelSize.height()), labelSize.width(), labelSize.height());
+        painter.fillRect(labelRect, QColor(0, 0, 0, 170));
+        painter.setPen(Qt::white);
+        painter.drawText(labelRect.adjusted(6, 0, -6, 0), Qt::AlignVCenter | Qt::AlignLeft, text);
+        painter.restore();
+    }
+}
+
+void MainWindow::postProcessSegmentationResult(InferenceEngine::Result &result)
+{
+    if (m_currentTask != TaskSelectionDialog::MRI_Segmentation)
+        return;
+    const double areaFactor = currentPixelArea();
+    annotateSegmentationImage(result.outputImage, result.dets, areaFactor);
+
+    for (auto &det : result.dets)
+    {
+        if (!det.hasMask || det.maskAreaPixels <= 0)
+            continue;
+        det.maskAreaMm2 = det.maskAreaPixels * areaFactor;
+    }
+    result.summary = tr("Segments: %1").arg(result.dets.size());
+    updateSegmentationStats(result.dets);
+}
+
+void MainWindow::annotateCachedSegmentationIfNeeded(const QString &path)
+{
+    if (m_currentTask != TaskSelectionDialog::MRI_Segmentation || m_output.isNull())
+        return;
+    bool needsAnnotation = false;
+    for (const auto &det : m_lastDets)
+    {
+        if (det.hasMask && det.maskAreaPixels > 0 && det.maskAreaMm2 <= 0.0)
+        {
+            needsAnnotation = true;
+            break;
+        }
+    }
+    if (!needsAnnotation)
+    {
+        updateSegmentationStats(m_lastDets);
+        return;
+    }
+
+    InferenceEngine::Result temp;
+    temp.outputImage = m_output;
+    temp.dets = m_lastDets;
+    temp.segmentationMask = m_segmentationMask;
+    postProcessSegmentationResult(temp);
+    m_output = temp.outputImage;
+    m_lastDets = temp.dets;
+    m_segmentationMask = temp.segmentationMask;
+    m_cacheImg[path] = m_output;
+    m_cacheDets[path] = m_lastDets;
+    if (!m_segmentationMask.isNull())
+        m_cacheSegMasks[path] = m_segmentationMask;
+    else
+        m_cacheSegMasks.remove(path);
+    statusBar()->showMessage(temp.summary, 5000);
+    const bool focus = (m_currentTask != TaskSelectionDialog::MRI_Segmentation);
+    setOutputImage(m_output, focus);
+}
+
+void MainWindow::updateSegmentationStats(const std::vector<InferenceEngine::Detection> &dets)
+{
+    if (!m_segStats)
+        return;
+
+    if (m_currentTask != TaskSelectionDialog::MRI_Segmentation)
+    {
+        clearSegmentationStats();
+        if (m_segStatsDock)
+            m_segStatsDock->hide();
+        return;
+    }
+
+    if (m_segStatsDock)
+        m_segStatsDock->show();
+
+    m_segStats->setRowCount(0);
+    for (const auto &det : dets)
+    {
+        if (!det.hasMask || det.maskAreaMm2 <= 0.0)
+            continue;
+        const int row = m_segStats->rowCount();
+        m_segStats->insertRow(row);
+        m_segStats->setItem(row, 0, new QTableWidgetItem(segmentationLabel(det.cls)));
+        m_segStats->setItem(row, 1, new QTableWidgetItem(QString::number(det.maskAreaMm2, 'f', 1)));
+        m_segStats->setItem(row, 2, new QTableWidgetItem(QString::number(det.maskAreaMm2 / 100.0, 'f', 2)));
+    }
+
+    if (m_segStats->rowCount() == 0)
+    {
+        m_segStats->setRowCount(1);
+        m_segStats->setItem(0, 0, new QTableWidgetItem(tr("No data")));
+        m_segStats->setItem(0, 1, new QTableWidgetItem("-"));
+        m_segStats->setItem(0, 2, new QTableWidgetItem("-"));
+    }
+}
+
+void MainWindow::clearSegmentationStats()
+{
+    if (!m_segStats)
+        return;
+    m_segStats->clearContents();
+    m_segStats->setRowCount(0);
+    if (m_currentTask == TaskSelectionDialog::MRI_Segmentation)
+    {
+        m_segStats->setRowCount(1);
+        m_segStats->setItem(0, 0, new QTableWidgetItem(tr("No data")));
+        m_segStats->setItem(0, 1, new QTableWidgetItem("-"));
+        m_segStats->setItem(0, 2, new QTableWidgetItem("-"));
+    }
+}
+
+void MainWindow::resizeEvent(QResizeEvent *event)
+{
+    QMainWindow::resizeEvent(event);
+    positionSliceIndicator();
+}
+
+bool MainWindow::isModelReadyForTask(TaskSelectionDialog::TaskType task) const
+{
+    return (task == TaskSelectionDialog::FAI_XRay) ? m_modelReady : m_mriModelReady;
+}
+
+InferenceEngine::Task MainWindow::inferenceTaskForMode(TaskSelectionDialog::TaskType task) const
+{
+    return (task == TaskSelectionDialog::MRI_Segmentation)
+               ? InferenceEngine::Task::HipMRI_Seg
+               : InferenceEngine::Task::FAI_XRay;
+}
+
+QString MainWindow::taskDisplayName(TaskSelectionDialog::TaskType task) const
+{
+    return (task == TaskSelectionDialog::MRI_Segmentation)
+               ? tr("MRI Segmentation")
+               : tr("FAI X-Ray Detection");
+}
+
+bool MainWindow::ensureModelReadyForCurrentTask(const QString &contextTitle)
+{
+    if (isModelReadyForTask(m_currentTask))
+        return true;
+
+    const QString message = tr("%1 model is not loaded. Please load it first.")
+                                .arg(taskDisplayName(m_currentTask));
+    statusBar()->showMessage(message, 5000);
+    QMessageBox::information(this,
+                             contextTitle.isEmpty() ? tr("Model Required") : contextTitle,
+                             message);
+    return false;
+}
+
+void MainWindow::unloadModelForTask(TaskSelectionDialog::TaskType task)
+{
+    if (task == TaskSelectionDialog::FAI_XRay)
+    {
+        if (!m_modelReady)
+            return;
+        m_engine.unload();
+        m_modelReady = false;
+        m_faiOnnxPath.clear();
+        log(tr("FAI model unloaded."));
+    }
+    else
+    {
+        if (!m_mriModelReady)
+            return;
+        m_mriEngine.unload();
+        m_mriModelReady = false;
+        m_mriOnnxPath.clear();
+        log(tr("MRI model unloaded."));
+    }
+    refreshActionStates();
+    updateStatusSummary();
 }

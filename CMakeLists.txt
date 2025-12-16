@@ -10,6 +10,14 @@ project(MedYOLO11Qt
 )
 
 # =============================================================================
+# 可选的用户本地配置（不提交到仓库）
+# 由 scripts/build/setup_dev_env.bat 生成，用于覆盖依赖路径等。
+# =============================================================================
+if(EXISTS "${CMAKE_SOURCE_DIR}/CMakeLists.txt.user")
+  include("${CMAKE_SOURCE_DIR}/CMakeLists.txt.user")
+endif()
+
+# =============================================================================
 # 基础配置
 # =============================================================================
 
@@ -50,8 +58,17 @@ endif()
 # =============================================================================
 
 # Qt 安装路径配置（根据实际安装位置调整）
-set(QT_INSTALL_PATH "E:/tools/Qt/6.9.2/msvc2022_64" CACHE PATH "Qt 6 安装路径")
-set(CMAKE_PREFIX_PATH ${QT_INSTALL_PATH})
+if(NOT DEFINED QT_INSTALL_PATH OR QT_INSTALL_PATH STREQUAL "")
+  if(DEFINED ENV{QT_INSTALL_PATH} AND NOT "$ENV{QT_INSTALL_PATH}" STREQUAL "")
+    set(QT_INSTALL_PATH "$ENV{QT_INSTALL_PATH}")
+  else()
+    set(QT_INSTALL_PATH "E:/tools/Qt/6.9.2/msvc2022_64")
+  endif()
+endif()
+set(QT_INSTALL_PATH "${QT_INSTALL_PATH}" CACHE PATH "Qt 6 安装路径")
+if(NOT QT_INSTALL_PATH STREQUAL "")
+  list(PREPEND CMAKE_PREFIX_PATH "${QT_INSTALL_PATH}")
+endif()
 
 # 查找 Qt6 组件
 find_package(Qt6 REQUIRED COMPONENTS Widgets Concurrent)
@@ -66,82 +83,60 @@ message(STATUS "Qt 安装路径: ${QT_INSTALL_PATH}")
 
 if(USE_GDCM)
   message(STATUS "正在配置 GDCM 医学影像库...")
-  
-  # GDCM 安装路径
-  set(GDCM_INSTALL_PATH "E:/tools/GDCM-3.2.0-Windows-x86_64" CACHE PATH "GDCM 安装路径")
+
+  set(_GDCM_DEFAULT_PATH "E:/tools/GDCM-3.2.0-Windows-x86_64")
+  if(NOT DEFINED GDCM_INSTALL_PATH OR GDCM_INSTALL_PATH STREQUAL "")
+    if(DEFINED ENV{GDCM_INSTALL_PATH} AND NOT "$ENV{GDCM_INSTALL_PATH}" STREQUAL "")
+      set(GDCM_INSTALL_PATH "$ENV{GDCM_INSTALL_PATH}")
+    else()
+      set(GDCM_INSTALL_PATH "${_GDCM_DEFAULT_PATH}")
+    endif()
+  endif()
+  set(GDCM_INSTALL_PATH "${GDCM_INSTALL_PATH}" CACHE PATH "GDCM 安装路径")
+
   set(GDCM_INCLUDE_DIRS ${GDCM_INSTALL_PATH}/include/gdcm-3.2)
   set(GDCM_LIBRARY_DIR ${GDCM_INSTALL_PATH}/lib)
-  
-  # 查找 GDCM 核心库
+
   find_library(GDCM_MSFF_LIB
     NAMES gdcmMSFF
-    PATHS ${GDCM_LIBRARY_DIR} 
+    PATHS ${GDCM_LIBRARY_DIR}
     NO_DEFAULT_PATH
   )
-  
+
   find_library(GDCM_COMMON_LIB
     NAMES gdcmCommon
     PATHS ${GDCM_LIBRARY_DIR}
     NO_DEFAULT_PATH
   )
-  
+
   find_library(GDCM_DSED_LIB
     NAMES gdcmDSED
     PATHS ${GDCM_LIBRARY_DIR}
     NO_DEFAULT_PATH
   )
 
-  # 验证 GDCM 库
   if(GDCM_MSFF_LIB AND GDCM_COMMON_LIB AND GDCM_DSED_LIB AND EXISTS ${GDCM_INCLUDE_DIRS})
-    message(STATUS "✅ GDCM 配置成功")
-    message(STATUS "   安装路径: ${GDCM_INSTALL_PATH}")
+    message(STATUS "✅ GDCM 配置成功: ${GDCM_INSTALL_PATH}")
     list(APPEND GDCM_LIBS ${GDCM_MSFF_LIB} ${GDCM_COMMON_LIB} ${GDCM_DSED_LIB})
     set(GDCM_INCLUDE_DIRS_FALLBACK ${GDCM_INCLUDE_DIRS})
     add_compile_definitions(HAVE_GDCM)
   else()
-    message(FATAL_ERROR "❌ GDCM 库未找到，请检查安装路径: ${GDCM_INSTALL_PATH}")
-    set(USE_GDCM OFF)
-  endif()
-endif()
-
-# ---------------- GDCM（DICOM库） ----------------
-if(USE_GDCM)
-  # 手动指定 GDCM 路径
-set(GDCM_INSTALL_PATH "E:/tools/GDCM-3.2.0-Windows-x86_64")
-set(GDCM_INCLUDE_DIRS ${GDCM_INSTALL_PATH}/include/gdcm-3.2)
-set(GDCM_LIBRARY_DIR ${GDCM_INSTALL_PATH}/lib)
-  
-  # 查找 GDCM 库
-  find_library(GDCM_MSFF_LIB
-    NAMES gdcmMSFF
-    PATHS ${GDCM_LIBRARY_DIR} 
-    NO_DEFAULT_PATH  # 只在指定路径查找
-  )
-  find_library(GDCM_COMMON_LIB
-    NAMES gdcmCommon
-    PATHS ${GDCM_LIBRARY_DIR}
-    NO_DEFAULT_PATH
-  )
-  find_library(GDCM_DSED_LIB
-    NAMES gdcmDSED
-    PATHS ${GDCM_LIBRARY_DIR}
-    NO_DEFAULT_PATH
-  )
-
-  if(GDCM_MSFF_LIB AND GDCM_COMMON_LIB AND GDCM_DSED_LIB AND EXISTS ${GDCM_INCLUDE_DIRS})
-    message(STATUS "GDCM found at: ${GDCM_INSTALL_PATH}")
-    list(APPEND GDCM_LIBS ${GDCM_MSFF_LIB} ${GDCM_COMMON_LIB} ${GDCM_DSED_LIB})
-    set(GDCM_INCLUDE_DIRS_FALLBACK ${GDCM_INCLUDE_DIRS})
-    add_compile_definitions(HAVE_GDCM)  # 启用DICOM功能
-  else()
-    message(FATAL_ERROR "GDCM not found in ${GDCM_INSTALL_PATH}. Check path.")
+    message(WARNING "GDCM 未找到（路径: ${GDCM_INSTALL_PATH}），已禁用 DICOM 功能")
     set(USE_GDCM OFF)
   endif()
 endif()
 
 # ---------------- ONNXRuntime ----------------
 # 手动指定 ONNXRuntime 路径
-set(ONNXRUNTIME_INSTALL_PATH "E:/tools/onnxruntime-win-x64-1.22.1")
+set(_ORT_DEFAULT_PATH "E:/tools/onnxruntime-win-x64-1.22.1")
+if(NOT DEFINED ONNXRUNTIME_INSTALL_PATH OR ONNXRUNTIME_INSTALL_PATH STREQUAL "")
+  if(DEFINED ENV{ONNXRUNTIME_INSTALL_PATH} AND NOT "$ENV{ONNXRUNTIME_INSTALL_PATH}" STREQUAL "")
+    set(ONNXRUNTIME_INSTALL_PATH "$ENV{ONNXRUNTIME_INSTALL_PATH}")
+  else()
+    set(ONNXRUNTIME_INSTALL_PATH "${_ORT_DEFAULT_PATH}")
+  endif()
+endif()
+set(ONNXRUNTIME_INSTALL_PATH "${ONNXRUNTIME_INSTALL_PATH}" CACHE PATH "ONNXRuntime 安装路径")
 set(ONNXRUNTIME_INCLUDE_DIR ${ONNXRUNTIME_INSTALL_PATH}/include)
 set(ONNXRUNTIME_LIBRARY_DIR ${ONNXRUNTIME_INSTALL_PATH}/lib)
 
@@ -181,7 +176,6 @@ target_include_directories(medapp PRIVATE
   src/ai
   src/ui
   src/medical
-  include
   ${GDCM_INCLUDE_DIRS_FALLBACK}  # 添加GDCM头文件路径
   ${ONNXRUNTIME_INCLUDE_DIR}     # 添加ONNX头文件路径
 )
@@ -205,11 +199,12 @@ if(WIN32)
   # Qt DLLs
   # 注意：路径需要根据你的实际Qt安装目录调整
   set(QT_DLL_DIR "${QT_INSTALL_PATH}/bin")
-  if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    file(GLOB QT_DLLS "${QT_DLL_DIR}/Qt6Widgetsd.dll" "${QT_DLL_DIR}/Qt6Cored.dll" "${QT_DLL_DIR}/Qt6Guid.dll")
-  else()
-    file(GLOB QT_DLLS "${QT_DLL_DIR}/Qt6Widgets.dll" "${QT_DLL_DIR}/Qt6Core.dll" "${QT_DLL_DIR}/Qt6Gui.dll")
-  endif()
+  set(QT_DLLS "")
+  foreach(_qt_dll Qt6Widgets.dll Qt6Core.dll Qt6Gui.dll Qt6Widgetsd.dll Qt6Cored.dll Qt6Guid.dll)
+    if(EXISTS "${QT_DLL_DIR}/${_qt_dll}")
+      list(APPEND QT_DLLS "${QT_DLL_DIR}/${_qt_dll}")
+    endif()
+  endforeach()
   
   # ONNXRuntime DLL
   set(ONNXRUNTIME_DLL "${ONNXRUNTIME_LIBRARY_DIR}/onnxruntime.dll")
@@ -221,32 +216,29 @@ if(WIN32)
     $<TARGET_FILE_DIR:medapp>
   )
   
-  # 复制Qt平台插件
-  if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    add_custom_command(TARGET medapp POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E make_directory
-      $<TARGET_FILE_DIR:medapp>/platforms/
-    )
-    add_custom_command(TARGET medapp POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-      "${QT_INSTALL_PATH}/plugins/platforms/qwindowsd.dll"
-      $<TARGET_FILE_DIR:medapp>/platforms/
-    )
-  else()
-    add_custom_command(TARGET medapp POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E make_directory
-      $<TARGET_FILE_DIR:medapp>/platforms/
-    )
-    add_custom_command(TARGET medapp POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-      "${QT_INSTALL_PATH}/plugins/platforms/qwindows.dll"
-      $<TARGET_FILE_DIR:medapp>/platforms/
-    )
-  endif()
-  # 复制模型文件 - 更新路径
+  # 复制Qt平台插件（同时复制 release/debug，避免多配置生成器下出错）
+  add_custom_command(TARGET medapp POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+    $<TARGET_FILE_DIR:medapp>/platforms/
+  )
+  foreach(_qt_plat qwindows.dll qwindowsd.dll)
+    if(EXISTS "${QT_INSTALL_PATH}/plugins/platforms/${_qt_plat}")
+      add_custom_command(TARGET medapp POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${QT_INSTALL_PATH}/plugins/platforms/${_qt_plat}"
+        $<TARGET_FILE_DIR:medapp>/platforms/
+      )
+    endif()
+  endforeach()
+
+  # 复制模型文件 - 更新路径（同时准备加密模型目录）
   add_custom_command(TARGET medapp POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory
     $<TARGET_FILE_DIR:medapp>/models/
+  )
+  add_custom_command(TARGET medapp POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+    $<TARGET_FILE_DIR:medapp>/models/encrypted/
   )
   add_custom_command(TARGET medapp POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -258,6 +250,20 @@ if(WIN32)
     ${CMAKE_SOURCE_DIR}/models/original/mri_segmentation.onnx
     $<TARGET_FILE_DIR:medapp>/models/
   )
+  if(EXISTS "${CMAKE_SOURCE_DIR}/models/encrypted/fai_xray.encrypted")
+    add_custom_command(TARGET medapp POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      ${CMAKE_SOURCE_DIR}/models/encrypted/fai_xray.encrypted
+      $<TARGET_FILE_DIR:medapp>/models/encrypted/
+    )
+  endif()
+  if(EXISTS "${CMAKE_SOURCE_DIR}/models/encrypted/mri_segmentation.encrypted")
+    add_custom_command(TARGET medapp POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      ${CMAKE_SOURCE_DIR}/models/encrypted/mri_segmentation.encrypted
+      $<TARGET_FILE_DIR:medapp>/models/encrypted/
+    )
+  endif()
   
   # GDCM DLLs
   file(GLOB GDCM_DLLS "${GDCM_INSTALL_PATH}/bin/gdcm*.dll")
@@ -310,10 +316,14 @@ if(WIN32)
           DESTINATION bin/models)
   install(FILES "${CMAKE_SOURCE_DIR}/models/original/mri_segmentation.onnx"
           DESTINATION bin/models)
-  # 安装加密模型
+  # 安装加密模型（与运行时默认配置一致）
   if(EXISTS "${CMAKE_SOURCE_DIR}/models/encrypted/fai_xray.encrypted")
     install(FILES "${CMAKE_SOURCE_DIR}/models/encrypted/fai_xray.encrypted"
-            DESTINATION bin/models RENAME "fai_xray.onnx")
+            DESTINATION bin/models/encrypted)
+  endif()
+  if(EXISTS "${CMAKE_SOURCE_DIR}/models/encrypted/mri_segmentation.encrypted")
+    install(FILES "${CMAKE_SOURCE_DIR}/models/encrypted/mri_segmentation.encrypted"
+            DESTINATION bin/models/encrypted)
   endif()
   
   # install(FILES "${CMAKE_SOURCE_DIR}/models/fai_xray.onnx"
@@ -352,4 +362,3 @@ endif()
 # 手动指定NSIS编译器路径
 set(CMAKE_NSIS_COMPILER "E:/tools/NSIS/makensis.exe")
 include(CPack)
-

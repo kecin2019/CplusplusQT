@@ -5,11 +5,14 @@
 #include <array>
 #include <cmath>
 #include <optional>
+#include <cfloat>
+#include <climits>
 #include <QFile>
 #include <QFileInfo>
 #include <QByteArray>
 #include <QCryptographicHash>
 #include <QDataStream>
+#include <QVector>
 #include "core/AppConfig.h"
 #include "core/ErrorHandler.h"
 
@@ -26,6 +29,9 @@ namespace
     {
         float x1, y1, x2, y2, score;
         int cls;
+        std::vector<float> maskCoeffs;
+        double maskAreaPixels{0.0};
+        bool hasMask{false};
     };
 
     inline float IoU(const Box &a, const Box &b)
@@ -354,6 +360,32 @@ struct InferenceEngine::OrtPack
 InferenceEngine::InferenceEngine() = default;
 InferenceEngine::~InferenceEngine() = default;
 
+void InferenceEngine::unload()
+{
+#ifdef HAVE_ORT
+    m_ort.reset();
+#endif
+    m_modelPath.clear();
+    m_isYoloDetect = false;
+    m_hasObj = false;
+    m_numClasses = 0;
+    m_channels = 0;
+    m_detOutputIndex = -1;
+    m_segOutputIndex = -1;
+    m_maskChannels = 0;
+    m_maskWidth = 0;
+    m_maskHeight = 0;
+}
+
+bool InferenceEngine::isLoaded() const
+{
+#ifdef HAVE_ORT
+    return m_ort && m_ort->session;
+#else
+    return false;
+#endif
+}
+
 bool InferenceEngine::loadModel(const QString &path)
 {
 #ifndef HAVE_ORT
@@ -377,6 +409,7 @@ bool InferenceEngine::loadModel(const QString &path)
                 return true;
             }
         }
+        unload();
 
         AppConfig &config = AppConfig::instance();
         QString keyStr = config.getModelProtectionKey();
@@ -460,7 +493,11 @@ bool InferenceEngine::loadModel(const QString &path)
         m_channels = 0;
         m_detOutputIndex = -1;
         m_segOutputIndex = -1;
+        m_maskChannels = 0;
+        m_maskWidth = 0;
+        m_maskHeight = 0;
 
+        int expectedMaskChannels = 0;
         for (size_t i = 0; i < no; ++i)
         {
             auto to = m_ort->session->GetOutputTypeInfo(i);
@@ -492,9 +529,40 @@ bool InferenceEngine::loadModel(const QString &path)
                         m_numClasses = std::max(1, nc_v5);
                     }
                     m_channels = C;
+                    m_detOutputIndex = static_cast<int>(i);
+                    const int clsOffset = m_hasObj ? 5 : 4;
+                    int maskCandidate = m_channels - (clsOffset + m_numClasses);
+                    if (maskCandidate > 0)
+                        expectedMaskChannels = maskCandidate;
                     break;
                 }
             }
+        }
+
+        for (size_t i = 0; i < no; ++i)
+        {
+            auto to = m_ort->session->GetOutputTypeInfo(i);
+            if (to.GetONNXType() != ONNX_TYPE_TENSOR)
+                continue;
+            auto info = to.GetTensorTypeAndShapeInfo();
+            if (info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+                continue;
+            auto sh = info.GetShape();
+            if (sh.size() != 4)
+                continue;
+            const int protoBatch = std::abs(static_cast<int>(sh[0]));
+            const int protoC = std::abs(static_cast<int>(sh[1]));
+            const int protoH = std::abs(static_cast<int>(sh[2]));
+            const int protoW = std::abs(static_cast<int>(sh[3]));
+            if (protoBatch != 1 || protoC <= 0 || protoH <= 0 || protoW <= 0)
+                continue;
+            if (expectedMaskChannels > 0 && protoC != expectedMaskChannels)
+                continue;
+            m_segOutputIndex = static_cast<int>(i);
+            m_maskChannels = protoC;
+            m_maskHeight = protoH;
+            m_maskWidth = protoW;
+            break;
         }
 
         m_modelPath = path;
@@ -564,364 +632,16 @@ bool InferenceEngine::isSegmentationModel() const
 #endif
 }
 
-QImage InferenceEngine::processSegmentation(const QImage &input) const
-{
-#ifndef HAVE_ORT
-    LOG_WARNING("编译时未启用 ONNXRuntime 支持，无法进行分割", "Inference", 5017);
-    return QImage();
-#else
-    try
-    {
-        if (!m_ort || !m_ort->session || !isSegmentationModel())
-            return QImage();
-
-        // 预处理：调整到模型输入尺寸
-        std::vector<float> tensor = preprocessSegmentationInput(input, m_inW, m_inH);
-        Ort::Value in = createInputTensor(tensor, m_inH, m_inW);
-
-        // 找到分割输出（形状为 [1, C, H, W]）
-        const size_t no = m_ort->session->GetOutputCount();
-        int segOutputIndex = -1;
-        for (size_t i = 0; i < no; ++i)
-        {
-            auto to = m_ort->session->GetOutputTypeInfo(i);
-            if (to.GetONNXType() != ONNX_TYPE_TENSOR)
-                continue;
-            auto inf = to.GetTensorTypeAndShapeInfo();
-            if (inf.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
-                continue;
-            auto sh = inf.GetShape();
-            if (sh.size() == 4 && sh[0] == 1 && sh[1] > 1)
-            {
-                segOutputIndex = i;
-                break;
-            }
-        }
-
-        if (segOutputIndex == -1)
-        {
-            LOG_WARNING("未找到有效的分割输出", "Inference", 5018);
-            return QImage();
-        }
-
-        const char *outName = m_ort->outputNames[segOutputIndex];
-        std::vector<Ort::Value> outs;
-        try
-        {
-            outs = m_ort->session->Run(Ort::RunOptions{nullptr},
-                                       m_ort->inputNames.data(), &in, 1,
-                                       &outName, 1);
-        }
-        catch (const Ort::Exception &e)
-        {
-            LOG_ERROR(QString("分割推理失败: %1").arg(e.what()), "Inference", 5019);
-            return QImage();
-        }
-
-        if (outs.empty() || !outs[0].IsTensor())
-            return QImage();
-
-        const float *data = outs[0].GetTensorData<float>();
-        auto info = outs[0].GetTensorTypeAndShapeInfo();
-        auto sh = info.GetShape(); // [1, C, H, W]
-
-        const int num_classes = sh[1];
-        const int seg_h = sh[2];
-        const int seg_w = sh[3];
-
-        // 创建分割掩码图像
-        QImage mask(seg_w, seg_h, QImage::Format_ARGB32);
-
-        // 简单的argmax处理：取每个位置概率最大的类别
-        for (int y = 0; y < seg_h; ++y)
-        {
-            QRgb *scanline = reinterpret_cast<QRgb *>(mask.scanLine(y));
-            for (int x = 0; x < seg_w; ++x)
-            {
-                int max_class = 0;
-                float max_val = -FLT_MAX;
-
-                for (int c = 0; c < num_classes; ++c)
-                {
-                    float val = data[c * seg_h * seg_w + y * seg_w + x];
-                    if (val > max_val)
-                    {
-                        max_val = val;
-                        max_class = c;
-                    }
-                }
-
-                // 为不同类别分配不同颜色
-                QColor color;
-                switch (max_class)
-                {
-                case 0:
-                    color = QColor(255, 0, 0, 128);
-                    break; // 红色 - 背景
-                case 1:
-                    color = QColor(0, 255, 0, 128);
-                    break; // 绿色 - 骨骼
-                case 2:
-                    color = QColor(0, 0, 255, 128);
-                    break; // 蓝色 - 软组织
-                case 3:
-                    color = QColor(255, 255, 0, 128);
-                    break; // 黄色 - 其他
-                default:
-                    color = QColor(128, 128, 128, 128);
-                }
-
-                scanline[x] = color.rgba();
-            }
-        }
-
-        return mask.scaled(input.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
-    }
-    catch (const std::exception &e)
-    {
-        LOG_ERROR(QString("分割处理异常: %1").arg(e.what()), "Inference", 5020);
-        return QImage();
-    }
-    catch (...)
-    {
-        LOG_ERROR("分割处理发生未知异常", "Inference", 5021);
-        return QImage();
-    }
-#endif
-}
-
 InferenceEngine::Result InferenceEngine::run(const QImage &input, Task taskHint) const
 {
-    Result R;
-    QImage vis = input.convertToFormat(QImage::Format_ARGB32);
-
-    // 根据任务类型选择处理方式
-    if (taskHint == Task::HipMRI_Seg && isSegmentationModel())
-    {
-        // MRI分割任务
-        R.segmentationMask = processSegmentation(input);
-        R.outputImage = input;
-        R.summary = "MRI segmentation completed";
-        return R;
-    }
+    const bool segmentationRequested = (taskHint == Task::HipMRI_Seg);
 #ifndef HAVE_ORT
-    R.outputImage = vis;
+    Result R;
+    R.outputImage = input;
     R.summary = "Built without ONNXRuntime";
     return R;
 #else
-    try
-    {
-        if (!m_ort || !m_ort->session)
-        {
-            R.outputImage = vis;
-            R.summary = "Model not loaded";
-            LOG_WARNING("推理请求但模型未加载", "Inference", 5022);
-            return R;
-        }
-
-        // 预处理（Ultralytics letterbox + CHW + [0,1]）
-        const int netW = m_inW, netH = m_inH;
-        DetectionPreprocessResult prep = preprocessDetectionInput(input, netW, netH);
-        Ort::Value in = createInputTensor(prep.tensor, prep.height, prep.width);
-
-        // 选择一个 rank=3 的 float 输出
-        const size_t no = m_ort->session->GetOutputCount();
-        int chosen = -1;
-        std::vector<std::vector<int64_t>> osh(no);
-        for (size_t i = 0; i < no; ++i)
-        {
-            auto t = m_ort->session->GetOutputTypeInfo(i);
-            if (t.GetONNXType() != ONNX_TYPE_TENSOR)
-                continue;
-            auto info = t.GetTensorTypeAndShapeInfo();
-            if (info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
-                continue;
-            osh[i] = info.GetShape();
-            if (chosen < 0 && osh[i].size() == 3)
-                chosen = (int)i;
-        }
-        if (chosen < 0)
-        {
-            R.outputImage = vis;
-            R.summary = "No rank-3 float output";
-            LOG_WARNING("模型输出格式不符合预期: 未找到3维浮点输出", "Inference", 5001);
-            return R;
-        }
-
-        const char *outName = m_ort->outputNames[(size_t)chosen];
-        std::vector<Ort::Value> outs;
-        try
-        {
-            outs = m_ort->session->Run(Ort::RunOptions{nullptr},
-                                       m_ort->inputNames.data(), &in, 1,
-                                       &outName, 1);
-        }
-        catch (const Ort::Exception &e)
-        {
-            R.outputImage = vis;
-            R.summary = QString::fromUtf8(e.what());
-            LOG_ERROR(QString("ONNX Runtime 推理异常: %1").arg(e.what()), "Inference", 5002);
-            return R;
-        }
-        if (outs.empty() || !outs[0].IsTensor())
-        {
-            R.outputImage = vis;
-            R.summary = "Invalid output";
-            LOG_WARNING("模型输出无效", "Inference", 5003);
-            return R;
-        }
-
-        const float *data = outs[0].GetTensorData<float>();
-        auto info = outs[0].GetTensorTypeAndShapeInfo();
-
-        auto sh = info.GetShape(); // [1,N,A] 或 [1,A,N]
-        const int d1 = std::abs((int)sh[1]);
-        const int d2 = std::abs((int)sh[2]);
-
-        // 属性维（A）应该是两者中较小的那个（通常 >=6 且远小于候选框数）
-        const int A = std::min(d1, d2);
-        const int N = std::max(d1, d2);
-
-        // 如果第二维等于属性维，则说明布局是 [1, N, A]（属性在最后一维）；否则为 [1, A, N]
-        const bool attrLast = (d2 == A);
-
-        int nc = (m_numClasses > 0 ? m_numClasses : std::max(1, std::max(A - 4, A - 5)));
-        bool hasObj = (m_numClasses > 0 ? m_hasObj : (A - 5 == nc));
-
-        // 统一的取值函数：i 为第 i 个候选框，k 为属性下标（0..A-1）
-        auto getAttr = [&](int i, int k) -> float
-        {
-            return attrLast ? data[i * A + k] : data[k * N + i];
-        };
-
-        auto need_sigmoid = [&](int offset, int len) -> bool
-        {
-            // 粗略判断是否需要 sigmoid（已是 0..1 就不再做）
-            int cnt = 0, out = 0;
-            for (int i = 0; i < std::min(len, 512); ++i)
-            {
-                float v = data[offset + i];
-                if (v < 0.f || v > 1.f)
-                    out++;
-                cnt++;
-            }
-            return out > cnt * 0.05;
-        };
-        bool cls_need_sig = false, obj_need_sig = false;
-        if (nc > 0)
-        {
-            int cls_off = hasObj ? 5 : 4;
-            int off0 = attrLast ? (0 * A + cls_off) : (cls_off * N + 0);
-            cls_need_sig = need_sigmoid(off0, std::min(nc, 64));
-        }
-        if (hasObj)
-        {
-            int off = attrLast ? (0 * A + 4) : (4 * N + 0);
-            obj_need_sig = need_sigmoid(off, std::min(N, 64));
-        }
-
-        std::vector<Box> dets;
-        dets.reserve(std::min(N, 3000));
-        for (int i = 0; i < N; ++i)
-        {
-            float cx = getAttr(i, 0), cy = getAttr(i, 1), bw = getAttr(i, 2), bh = getAttr(i, 3);
-
-            float mx = std::max({std::fabs(cx), std::fabs(cy), std::fabs(bw), std::fabs(bh)});
-            bool normalized = (mx <= 1.5f); // 认为是 0..1 坐标
-            if (normalized)
-            {
-                cx *= netW;
-                cy *= netH;
-                bw *= netW;
-                bh *= netH;
-            }
-
-            float obj = hasObj ? getAttr(i, 4) : 1.f;
-            if (hasObj && obj_need_sig)
-                obj = sigmoid(obj);
-
-            int best = -1;
-            float bestp = 0.f;
-            int cls_off = hasObj ? 5 : 4;
-            for (int k = 0; k < nc; ++k)
-            {
-                float p = getAttr(i, cls_off + k);
-                if (cls_need_sig)
-                    p = sigmoid(p);
-                float s = hasObj ? (obj * p) : p;
-                if (s > bestp)
-                {
-                    bestp = s;
-                    best = k;
-                }
-            }
-            if (best < 0 || bestp < m_confThr)
-                continue;
-
-            float x1 = cx - bw * 0.5f, y1 = cy - bh * 0.5f, x2 = cx + bw * 0.5f, y2 = cy + bh * 0.5f;
-            x1 = std::clamp(x1, 0.f, (float)netW - 1.f);
-            y1 = std::clamp(y1, 0.f, (float)netH - 1.f);
-            x2 = std::clamp(x2, 0.f, (float)netW - 1.f);
-            y2 = std::clamp(y2, 0.f, (float)netH - 1.f);
-
-            // 压到 4 类范围（若模型有更多类别）
-            int mapped = std::clamp(best, 0, 3);
-            dets.push_back({x1, y1, x2, y2, bestp, mapped});
-        }
-
-        auto kept = nms_classwise(std::move(dets), m_iouThr);
-        scale_boxes_back(kept, prep.scale, prep.padW, prep.padH, input.width(), input.height());
-
-        for (const auto &d : kept)
-        {
-            QRectF r(d.x1, d.y1, d.x2 - d.x1, d.y2 - d.y1);
-            QString txt = QString("%1  %2%").arg(InferenceEngine::className(d.cls)).arg(int(std::round(d.score * 100)));
-            drawBox(vis, r, txt, InferenceEngine::classColor(d.cls));
-        }
-
-        R.outputImage = vis;
-        R.dets.reserve(kept.size());
-        for (auto &b : kept)
-            R.dets.push_back({b.x1, b.y1, b.x2, b.y2, b.score, b.cls});
-
-        int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
-        for (auto &b : kept)
-        {
-            if (b.cls == 0)
-                ++c0;
-            else if (b.cls == 1)
-                ++c1;
-            else if (b.cls == 2)
-                ++c2;
-            else
-                ++c3;
-        }
-        R.summary = QString("Detections: %1  [CAM:%2  PINCER:%3  MIXED:%4  NORMAL:%5]")
-                        .arg((int)kept.size())
-                        .arg(c0)
-                        .arg(c1)
-                        .arg(c2)
-                        .arg(c3);
-
-        LOG_INFO(QString("推理完成: %1").arg(R.summary), "Inference");
-        return R;
-    }
-    catch (const std::exception &e)
-    {
-        LOG_ERROR(QString("推理异常: %1").arg(e.what()), "Inference", 5023);
-        Result R;
-        R.outputImage = vis;
-        R.summary = QString("推理异常: %1").arg(e.what());
-        return R;
-    }
-    catch (...)
-    {
-        LOG_ERROR("推理发生未知异常", "Inference", 5024);
-        Result R;
-        R.outputImage = vis;
-        R.summary = "推理发生未知异常";
-        return R;
-    }
+    return runYolo(input, segmentationRequested && hasSegmentationSupport());
 #endif
 }
 
@@ -936,3 +656,394 @@ QColor InferenceEngine::classColor(int cls)
     static const QColor colors[] = {QColor(255, 0, 0), QColor(0, 255, 0), QColor(0, 0, 255), QColor(128, 128, 128)};
     return (cls >= 0 && cls < 4) ? colors[cls] : QColor(128, 128, 128);
 }
+
+QString InferenceEngine::segmentationClassName(int cls)
+{
+    const QStringList names = AppConfig::instance().getMriClassNames();
+    if (cls >= 0 && cls < names.size())
+        return names[cls];
+    return QStringLiteral("Muscle %1").arg(cls + 1);
+}
+
+QColor InferenceEngine::segmentationClassColor(int cls)
+{
+    static const QVector<QColor> palette = {
+        QColor(252, 90, 141),
+        QColor(88, 205, 237),
+        QColor(130, 202, 157),
+        QColor(255, 196, 87),
+        QColor(181, 148, 226),
+        QColor(255, 147, 74),
+        QColor(120, 144, 156),
+        QColor(255, 99, 71)};
+    if (cls >= 0 && cls < palette.size())
+        return palette[cls];
+    const int hue = (cls * 57) % 360;
+    return QColor::fromHsv(hue, 180, 240);
+}
+#ifdef HAVE_ORT
+InferenceEngine::Result InferenceEngine::runYolo(const QImage &input, bool segmentationMode) const
+{
+    Result R;
+    QImage vis = input.convertToFormat(QImage::Format_ARGB32);
+
+    try
+    {
+        if (!m_ort || !m_ort->session)
+        {
+            R.outputImage = vis;
+            R.summary = "Model not loaded";
+            LOG_WARNING("推理请求但模型未加载", "Inference", 5022);
+            return R;
+        }
+
+        const int netW = m_inW, netH = m_inH;
+        DetectionPreprocessResult prep = preprocessDetectionInput(input, netW, netH);
+        Ort::Value in = createInputTensor(prep.tensor, prep.height, prep.width);
+
+        const size_t no = m_ort->session->GetOutputCount();
+        int detIndex = (m_detOutputIndex >= 0 && m_detOutputIndex < (int)no) ? m_detOutputIndex : -1;
+        auto isValidDetOutput = [&](int idx) -> bool {
+            if (idx < 0 || idx >= (int)no)
+                return false;
+            auto to = m_ort->session->GetOutputTypeInfo((size_t)idx);
+            if (to.GetONNXType() != ONNX_TYPE_TENSOR)
+                return false;
+            auto info = to.GetTensorTypeAndShapeInfo();
+            if (info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+                return false;
+            auto sh = info.GetShape();
+            return sh.size() == 3;
+        };
+        if (!isValidDetOutput(detIndex))
+            detIndex = -1;
+        if (detIndex < 0)
+        {
+            for (size_t i = 0; i < no; ++i)
+            {
+                if (isValidDetOutput((int)i))
+                {
+                    detIndex = (int)i;
+                    break;
+                }
+            }
+        }
+        if (detIndex < 0)
+        {
+            R.outputImage = vis;
+            R.summary = "Detection output missing";
+            LOG_WARNING("模型输出无效: 未找到检测张量", "Inference", 5001);
+            return R;
+        }
+
+        bool wantSegmentation = segmentationMode && hasSegmentationSupport();
+        std::vector<int> requestIndices;
+        requestIndices.push_back(detIndex);
+        if (wantSegmentation && m_segOutputIndex >= 0 &&
+            m_segOutputIndex < static_cast<int>(no))
+            requestIndices.push_back(m_segOutputIndex);
+
+        std::vector<const char *> requestNames;
+        requestNames.reserve(requestIndices.size());
+        for (int idx : requestIndices)
+            requestNames.push_back(m_ort->outputNames[static_cast<size_t>(idx)]);
+
+        auto outputs = m_ort->session->Run(Ort::RunOptions{nullptr},
+                                           m_ort->inputNames.data(), &in, 1,
+                                           requestNames.data(), requestNames.size());
+        if (outputs.empty() || !outputs[0].IsTensor())
+        {
+            R.outputImage = vis;
+            R.summary = "Invalid output";
+            LOG_WARNING("模型输出无效", "Inference", 5003);
+            return R;
+        }
+
+        const float *data = outputs[0].GetTensorData<float>();
+        auto info = outputs[0].GetTensorTypeAndShapeInfo();
+        auto sh = info.GetShape();
+        const int d1 = std::abs((int)sh[1]);
+        const int d2 = std::abs((int)sh[2]);
+        const int attrCount = std::min(d1, d2);
+        const int detCount = std::max(d1, d2);
+        const bool attrLast = (d2 == attrCount);
+
+        int nc = (m_numClasses > 0 ? m_numClasses : std::max(1, std::max(attrCount - 4, attrCount - 5)));
+        bool hasObj = (m_numClasses > 0 ? m_hasObj : (attrCount - 5 == nc));
+
+        auto getAttr = [&](int detIdx, int attrIdx) -> float
+        {
+            return attrLast ? data[detIdx * attrCount + attrIdx]
+                            : data[attrIdx * detCount + detIdx];
+        };
+
+        const int clsOffset = hasObj ? 5 : 4;
+
+        bool segReady = wantSegmentation && outputs.size() > 1 && outputs[1].IsTensor() && m_maskChannels > 0;
+        int maskOffset = -1;
+        int maskChannels = segReady ? m_maskChannels : 0;
+        if (segReady)
+        {
+            maskOffset = clsOffset + nc;
+            if (maskOffset + maskChannels > attrCount)
+                segReady = false;
+        }
+
+        std::vector<Box> candidates;
+        candidates.reserve(std::min(detCount, 3000));
+        for (int idx = 0; idx < detCount; ++idx)
+        {
+            float cx = getAttr(idx, 0);
+            float cy = getAttr(idx, 1);
+            float bw = getAttr(idx, 2);
+            float bh = getAttr(idx, 3);
+
+            const float maxAbs = std::max({std::fabs(cx), std::fabs(cy), std::fabs(bw), std::fabs(bh)});
+            const bool normalized = (maxAbs <= 1.5f);
+            if (normalized)
+            {
+                cx *= netW;
+                cy *= netH;
+                bw *= netW;
+                bh *= netH;
+            }
+
+            float obj = hasObj ? sigmoid(getAttr(idx, 4)) : 1.f;
+
+            int bestClass = -1;
+            float bestScore = 0.f;
+            for (int k = 0; k < nc; ++k)
+            {
+                float clsProb = sigmoid(getAttr(idx, clsOffset + k));
+                float score = hasObj ? (obj * clsProb) : clsProb;
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestClass = k;
+                }
+            }
+            if (bestClass < 0 || bestScore < m_confThr)
+                continue;
+
+            float x1 = cx - bw * 0.5f;
+            float y1 = cy - bh * 0.5f;
+            float x2 = cx + bw * 0.5f;
+            float y2 = cy + bh * 0.5f;
+            x1 = std::clamp(x1, 0.f, (float)netW - 1.f);
+            y1 = std::clamp(y1, 0.f, (float)netH - 1.f);
+            x2 = std::clamp(x2, 0.f, (float)netW - 1.f);
+            y2 = std::clamp(y2, 0.f, (float)netH - 1.f);
+
+            Box box;
+            box.x1 = x1;
+            box.y1 = y1;
+            box.x2 = x2;
+            box.y2 = y2;
+            box.score = bestScore;
+            box.cls = segmentationMode ? bestClass : std::clamp(bestClass, 0, 3);
+
+            if (segReady && maskOffset >= 0)
+            {
+                box.maskCoeffs.resize(static_cast<size_t>(maskChannels));
+                for (int m = 0; m < maskChannels; ++m)
+                    box.maskCoeffs[(size_t)m] = getAttr(idx, maskOffset + m);
+            }
+
+            candidates.push_back(std::move(box));
+        }
+
+        auto kept = nms_classwise(std::move(candidates), m_iouThr);
+        scale_boxes_back(kept, prep.scale, prep.padW, prep.padH, input.width(), input.height());
+
+        QImage overlay;
+        if (segReady && !kept.empty())
+        {
+            const Ort::Value &protoTensor = outputs.back();
+            auto protoInfo = protoTensor.GetTensorTypeAndShapeInfo();
+            auto protoShape = protoInfo.GetShape();
+            if (protoShape.size() == 4)
+            {
+                const int protoBatch = std::abs((int)protoShape[0]);
+                const int protoC = std::abs((int)protoShape[1]);
+                const int protoH = std::abs((int)protoShape[2]);
+                const int protoW = std::abs((int)protoShape[3]);
+                if (protoBatch == 1 && protoC == maskChannels && protoH > 0 && protoW > 0)
+                {
+                    const float *protoData = protoTensor.GetTensorData<float>();
+                    const size_t protoPlane = (size_t)protoH * (size_t)protoW;
+                    std::vector<float> buffer(protoPlane);
+                    QImage maskComposite(input.size(), QImage::Format_ARGB32_Premultiplied);
+                    maskComposite.fill(Qt::transparent);
+                    const QRect canvas(0, 0, input.width(), input.height());
+                    const float maskThreshold = 0.45f;
+
+                    for (auto &box : kept)
+                    {
+                        if (box.maskCoeffs.size() != (size_t)maskChannels)
+                            continue;
+
+                        std::fill(buffer.begin(), buffer.end(), 0.f);
+                        for (int c = 0; c < maskChannels; ++c)
+                        {
+                            const float coeff = box.maskCoeffs[(size_t)c];
+                            const float *plane = protoData + (size_t)c * protoPlane;
+                            for (size_t idx = 0; idx < protoPlane; ++idx)
+                                buffer[idx] += coeff * plane[idx];
+                        }
+                        for (float &v : buffer)
+                            v = sigmoid(v);
+
+                        QImage mask(protoW, protoH, QImage::Format_Grayscale8);
+                        for (int y = 0; y < protoH; ++y)
+                        {
+                            uchar *row = mask.scanLine(y);
+                            for (int x = 0; x < protoW; ++x)
+                            {
+                                float val = buffer[(size_t)y * protoW + x];
+                                row[x] = static_cast<uchar>(std::clamp<int>(std::lround(val * 255.f), 0, 255));
+                            }
+                        }
+
+                        QImage resized = mask.scaled(prep.width, prep.height, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+                        int cropX = std::clamp(prep.padW, 0, resized.width());
+                        int cropY = std::clamp(prep.padH, 0, resized.height());
+                        int cropW = std::clamp((int)std::round(input.width() * prep.scale), 0, resized.width() - cropX);
+                        int cropH = std::clamp((int)std::round(input.height() * prep.scale), 0, resized.height() - cropY);
+                        if (cropW <= 0 || cropH <= 0)
+                            continue;
+
+                        QImage cropped = resized.copy(cropX, cropY, cropW, cropH);
+                        QImage restored = cropped.scaled(input.width(), input.height(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+
+                        QRect roi(std::max(0, (int)std::floor(box.x1)),
+                                  std::max(0, (int)std::floor(box.y1)),
+                                  std::max(1, (int)std::ceil(box.x2 - box.x1)),
+                                  std::max(1, (int)std::ceil(box.y2 - box.y1)));
+                        roi = roi.intersected(canvas);
+                        if (roi.isEmpty())
+                            continue;
+
+                        double covered = 0.0;
+                        for (int y = roi.top(); y <= roi.bottom(); ++y)
+                        {
+                            const uchar *maskRow = restored.constScanLine(y);
+                            QRgb *overlayRow = reinterpret_cast<QRgb *>(maskComposite.scanLine(y));
+                            for (int x = roi.left(); x <= roi.right(); ++x)
+                            {
+                                float alpha = maskRow[x] / 255.f;
+                                if (alpha < maskThreshold)
+                                    continue;
+                                covered += 1.0;
+                                int a = std::clamp<int>(std::lround(alpha * 200.f), 0, 255);
+                                QColor color = segmentationClassColor(box.cls);
+                                QRgb current = overlayRow[x];
+                                if (qAlpha(current) < a)
+                                    overlayRow[x] = qRgba(color.red(), color.green(), color.blue(), a);
+                            }
+                        }
+
+                        box.maskAreaPixels = covered;
+                        box.hasMask = covered > 0.0;
+                    }
+
+                    overlay = maskComposite.convertToFormat(QImage::Format_ARGB32);
+                    if (!overlay.isNull())
+                    {
+                        QPainter painter(&vis);
+                        painter.setRenderHints(QPainter::Antialiasing | QPainter::SmoothPixmapTransform);
+                        painter.drawImage(QPoint(), overlay);
+                    }
+                }
+            }
+        }
+
+        for (const auto &box : kept)
+        {
+            QRectF rect(box.x1, box.y1, box.x2 - box.x1, box.y2 - box.y1);
+            QString label = segmentationMode ? segmentationClassName(box.cls) : className(box.cls);
+            QString text = segmentationMode
+                               ? label
+                               : QString("%1  %2%").arg(label).arg(int(std::round(box.score * 100)));
+            QColor color = segmentationMode ? segmentationClassColor(box.cls) : classColor(box.cls);
+            drawBox(vis, rect, text, color);
+        }
+
+        R.outputImage = vis;
+        R.segmentationMask = (segmentationMode ? overlay : QImage());
+        R.dets.reserve(kept.size());
+        for (const auto &box : kept)
+        {
+            Detection det;
+            det.x1 = box.x1;
+            det.y1 = box.y1;
+            det.x2 = box.x2;
+            det.y2 = box.y2;
+            det.score = box.score;
+            det.cls = box.cls;
+            det.maskAreaPixels = box.maskAreaPixels;
+            det.hasMask = box.hasMask;
+            R.dets.push_back(det);
+        }
+
+        if (segmentationMode)
+        {
+            R.summary = kept.empty() ? QStringLiteral("No segmentation detected")
+                                     : QStringLiteral("Segments: %1").arg((int)kept.size());
+        }
+        else
+        {
+            int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+            for (const auto &b : kept)
+            {
+                if (b.cls == 0)
+                    ++c0;
+                else if (b.cls == 1)
+                    ++c1;
+                else if (b.cls == 2)
+                    ++c2;
+                else
+                    ++c3;
+            }
+            R.summary = QStringLiteral("Detections: %1  [CAM:%2  PINCER:%3  MIXED:%4  NORMAL:%5]")
+                            .arg((int)kept.size())
+                            .arg(c0)
+                            .arg(c1)
+                            .arg(c2)
+                            .arg(c3);
+        }
+
+        return R;
+    }
+    catch (const std::exception &e)
+    {
+        LOG_ERROR(QString("推理异常: %1").arg(e.what()), "Inference", 5023);
+        Result err;
+        err.outputImage = vis;
+        err.summary = QString("推理异常: %1").arg(e.what());
+        return err;
+    }
+    catch (...)
+    {
+        LOG_ERROR("推理发生未知异常", "Inference", 5024);
+        Result err;
+        err.outputImage = vis;
+        err.summary = "推理发生未知异常";
+        return err;
+    }
+}
+#endif
+
+bool InferenceEngine::hasSegmentationSupport() const
+{
+#ifdef HAVE_ORT
+    return m_ort && m_ort->session &&
+           m_segOutputIndex >= 0 &&
+           m_maskChannels > 0 &&
+           m_maskWidth > 0 &&
+           m_maskHeight > 0;
+#else
+    return false;
+#endif
+}
+
+

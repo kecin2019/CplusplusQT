@@ -7,15 +7,112 @@
 #include <string>
 #include <functional>
 #include <algorithm>
+#include <limits>
 
 #ifdef HAVE_GDCM
 #include <gdcmImageReader.h>
+#include <gdcmReader.h>
 #include <gdcmImage.h>
 #include <gdcmPixelFormat.h>
 #include <gdcmAttribute.h>
 #include <gdcmPhotometricInterpretation.h>
 #include <gdcmDataSet.h>
 #include <gdcmTag.h>
+#endif
+
+#ifdef HAVE_GDCM
+static bool readFirstNumber(const gdcm::DataSet &ds, uint16_t g, uint16_t e, double &outVal)
+{
+    gdcm::Tag t(g, e);
+    if (!ds.FindDataElement(t))
+        return false;
+    const gdcm::DataElement &de = ds.GetDataElement(t);
+    const gdcm::ByteValue *bv = de.GetByteValue();
+    if (!bv)
+        return false;
+    std::string s(bv->GetPointer(), bv->GetLength());
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\0' || s.back() == '\r' || s.back() == '\n'))
+        s.pop_back();
+    size_t p = s.find('\\');
+    if (p != std::string::npos)
+        s = s.substr(0, p);
+    try
+    {
+        outVal = std::stod(s);
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+#endif
+
+// no additional processing namespace needed
+#ifdef HAVE_GDCM
+QString readStringTag(const gdcm::DataSet &ds, uint16_t group, uint16_t element)
+{
+    gdcm::Tag tag(group, element);
+    if (!ds.FindDataElement(tag))
+        return {};
+    const gdcm::DataElement &de = ds.GetDataElement(tag);
+    const gdcm::ByteValue *bv = de.GetByteValue();
+    if (!bv)
+        return {};
+    std::string s(bv->GetPointer(), bv->GetLength());
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\0' || s.back() == '\r' || s.back() == '\n'))
+        s.pop_back();
+    return QString::fromStdString(s);
+}
+
+void parsePixelSpacing(const QString &spacingStr, double &rowSpacing, double &colSpacing)
+{
+    if (spacingStr.isEmpty())
+        return;
+    QString cleaned = spacingStr;
+    cleaned.replace(',', ' ');
+    QStringList parts = cleaned.split('\\');
+    if (parts.size() < 2)
+        parts = cleaned.split(' ', Qt::SkipEmptyParts);
+    if (parts.size() >= 2)
+    {
+        bool okRow = false;
+        bool okCol = false;
+        double row = parts[0].toDouble(&okRow);
+        double col = parts[1].toDouble(&okCol);
+        if (okRow && row > 0)
+            rowSpacing = row;
+        if (okCol && col > 0)
+            colSpacing = col;
+    }
+}
+
+DicomUtils::SliceInfo extractSliceInfo(const gdcm::DataSet &ds)
+{
+    DicomUtils::SliceInfo info;
+    info.seriesInstanceUID = readStringTag(ds, 0x0020, 0x000E);
+    QString spacing = readStringTag(ds, 0x0028, 0x0030);
+    parsePixelSpacing(spacing, info.spacingY, info.spacingX);
+    double instance = 0.0;
+    if (readFirstNumber(ds, 0x0020, 0x0013, instance))
+        info.instanceNumber = static_cast<int>(std::round(instance));
+    double loc = 0.0;
+    if (readFirstNumber(ds, 0x0020, 0x1041, loc))
+        info.sliceLocation = loc;
+    else
+    {
+        QString ipp = readStringTag(ds, 0x0020, 0x0032);
+        const QStringList parts = ipp.split('\\');
+        if (parts.size() == 3)
+        {
+            bool ok = false;
+            double z = parts[2].toDouble(&ok);
+            if (ok)
+                info.sliceLocation = z;
+        }
+    }
+    return info;
+}
 #endif
 
 namespace DicomUtils
@@ -36,38 +133,7 @@ namespace DicomUtils
     }
 
 #ifdef HAVE_GDCM
-    // 读取形如 "40\80" 的 DS 标签，取第一个数字
-    static bool readFirstNumber(const gdcm::DataSet &ds, uint16_t g, uint16_t e, double &outVal)
-    {
-        gdcm::Tag t(g, e);
-        if (!ds.FindDataElement(t))
-            return false;
-        const gdcm::DataElement &de = ds.GetDataElement(t);
-        const gdcm::ByteValue *bv = de.GetByteValue();
-        if (!bv)
-            return false;
-        std::string s(bv->GetPointer(), bv->GetLength());
-        // 去尾部空白
-        while (!s.empty() && (s.back() == ' ' || s.back() == '\0' || s.back() == '\r' || s.back() == '\n'))
-            s.pop_back();
-        // 取第一个值
-        size_t p = s.find('\\');
-        if (p != std::string::npos)
-            s = s.substr(0, p);
-        try
-        {
-            outVal = std::stod(s);
-            return true;
-        }
-        catch (...)
-        {
-            return false;
-        }
-    }
-#endif
-
-#ifdef HAVE_GDCM
-    bool loadDicomToQImage(const QString &path, QImage &out, QMap<QString, QString> *meta)
+    bool loadDicomToQImage(const QString &path, QImage &out, QMap<QString, QString> *meta, SliceInfo *info)
     {
         gdcm::ImageReader ir;
         ir.SetFileName(path.toStdString().c_str());
@@ -81,194 +147,144 @@ namespace DicomUtils
         const unsigned int *dims = gimg.GetDimensions();
         const int w = static_cast<int>(dims[0]);
         const int h = static_cast<int>(dims[1]);
-
-        // 取原始像素缓冲
-        const size_t len = gimg.GetBufferLength();
-        std::vector<char> buffer(len);
-        if (!gimg.GetBuffer(buffer.data()))
+        if (w <= 0 || h <= 0)
         {
-            qWarning() << "GDCM: GetBuffer failed";
+            qWarning() << "GDCM: invalid image size";
             return false;
         }
 
+        const size_t pixelCount = static_cast<size_t>(w) * static_cast<size_t>(h);
+        const size_t bufferLen = gimg.GetBufferLength();
         const gdcm::PixelFormat &pf = gimg.GetPixelFormat();
-        const int bitsAlloc = pf.GetBitsAllocated(); // 8 或 16
-        const bool is16 = (bitsAlloc > 8);
-        const bool isSigned = (pf.GetPixelRepresentation() == 1);  // 0=UNSIGNED, 1=SIGNED
-        const unsigned int spp = pf.GetSamplesPerPixel();          // 1/3
-        const unsigned int planar = gimg.GetPlanarConfiguration(); // 0/1
+        const int bitsAlloc = pf.GetBitsAllocated();
+        const bool is16 = bitsAlloc > 8;
+        const bool isSigned = (pf.GetPixelRepresentation() == 1);
+        const unsigned int spp = std::max(1u, static_cast<unsigned int>(pf.GetSamplesPerPixel()));
+        const unsigned int planar = gimg.GetPlanarConfiguration();
         const gdcm::PhotometricInterpretation::PIType pi =
             gimg.GetPhotometricInterpretation().GetType();
 
-        // 读取 WW/WC & 斜率/截距
+        std::vector<uint16_t> buffer16;
+        std::vector<uint8_t> buffer8;
+        if (is16)
+        {
+            buffer16.resize(bufferLen / sizeof(uint16_t));
+            if (!gimg.GetBuffer(reinterpret_cast<char *>(buffer16.data())))
+            {
+                qWarning() << "GDCM: GetBuffer failed";
+                return false;
+            }
+        }
+        else
+        {
+            buffer8.resize(bufferLen);
+            if (!gimg.GetBuffer(reinterpret_cast<char *>(buffer8.data())))
+            {
+                qWarning() << "GDCM: GetBuffer failed";
+                return false;
+            }
+        }
+
         const gdcm::DataSet &ds = ir.GetFile().GetDataSet();
         double wc = 0.0, ww = 0.0, slope = 1.0, inter = 0.0;
 
-        (void)readFirstNumber(ds, 0x0028, 0x1050, wc); // WindowCenter
-        (void)readFirstNumber(ds, 0x0028, 0x1051, ww); // WindowWidth
+        (void)readFirstNumber(ds, 0x0028, 0x1050, wc);
+        (void)readFirstNumber(ds, 0x0028, 0x1051, ww);
 
         if (ds.FindDataElement(gdcm::Tag(0x0028, 0x1053)))
-        { // RescaleSlope
+        {
             gdcm::Attribute<0x0028, 0x1053> at;
             at.SetFromDataElement(ds.GetDataElement(gdcm::Tag(0x0028, 0x1053)));
             slope = at.GetValue();
         }
         if (ds.FindDataElement(gdcm::Tag(0x0028, 0x1052)))
-        { // RescaleIntercept
+        {
             gdcm::Attribute<0x0028, 0x1052> at;
             at.SetFromDataElement(ds.GetDataElement(gdcm::Tag(0x0028, 0x1052)));
             inter = at.GetValue();
         }
 
-        // 像素获取器：返回 WL 前的线性值
-        std::function<double(int)> fetch;
-
-        // 自动窗口（当没有有效 WW/WC 时）
-        auto ensureWindow = [&](auto getVal)
+        auto readChannel = [&](size_t idx, unsigned int channel) -> double
         {
-            if (ww <= 0.0)
+            if (channel >= spp)
+                return 0.0;
+            size_t offset = (planar == 0) ? idx * spp + channel
+                                          : static_cast<size_t>(channel) * pixelCount + idx;
+            if (is16)
             {
-                double minv = 1e300, maxv = -1e300;
-                for (int i = 0; i < w * h; ++i)
+                if (offset >= buffer16.size())
+                    return 0.0;
+                const uint16_t raw = buffer16[offset];
+                return isSigned ? static_cast<int16_t>(raw) : raw;
+            }
+            if (offset >= buffer8.size())
+                return 0.0;
+            return buffer8[offset];
+        };
+
+        auto sampleAt = [&](size_t idx) -> double
+        {
+            if (spp >= 3)
+            {
+                double r = readChannel(idx, 0);
+                double g = readChannel(idx, 1);
+                double b = readChannel(idx, 2);
+                using PI = gdcm::PhotometricInterpretation;
+                double y;
+                if (pi == PI::YBR_FULL || pi == PI::YBR_FULL_422 || pi == PI::YBR_PARTIAL_422 ||
+                    pi == PI::YBR_ICT || pi == PI::YBR_RCT)
                 {
-                    double v = getVal(i);
-                    if (v < minv)
-                        minv = v;
-                    if (v > maxv)
-                        maxv = v;
-                }
-                if (maxv > minv)
-                {
-                    wc = 0.5 * (minv + maxv);
-                    ww = (maxv - minv);
+                    y = r;
                 }
                 else
                 {
-                    wc = 127.0;
-                    ww = 255.0;
+                    y = 0.299 * r + 0.587 * g + 0.114 * b;
                 }
+                return inter + slope * y;
             }
+
+            double raw = is16 ? (isSigned ? static_cast<int16_t>(buffer16[idx]) : buffer16[idx])
+                              : buffer8[idx];
+            return inter + slope * raw;
         };
 
-        // 判断是否为 YBR 家族（常见：FULL / FULL_422 / PARTIAL_422 / ICT / RCT）
-        auto isYBR = [&](gdcm::PhotometricInterpretation::PIType t) -> bool
+        double minSample = std::numeric_limits<double>::max();
+        double maxSample = std::numeric_limits<double>::lowest();
+        for (size_t idx = 0; idx < pixelCount; ++idx)
         {
-            using PI = gdcm::PhotometricInterpretation;
-            return t == PI::YBR_FULL || t == PI::YBR_FULL_422 || t == PI::YBR_PARTIAL_422 || t == PI::YBR_ICT || t == PI::YBR_RCT;
-        };
-
-        if (spp == 1 || pi == gdcm::PhotometricInterpretation::PALETTE_COLOR)
-        {
-            // 单通道（最常见）或 Palette（当作索引灰度近似显示）
-            if (is16)
-            {
-                const uint16_t *src = reinterpret_cast<const uint16_t *>(buffer.data());
-                fetch = [&](int i) -> double
-                {
-                    double s = isSigned ? static_cast<int16_t>(src[i]) : static_cast<uint16_t>(src[i]);
-                    return inter + slope * s;
-                };
-            }
-            else
-            {
-                const uint8_t *src = reinterpret_cast<const uint8_t *>(buffer.data());
-                fetch = [&](int i) -> double
-                {
-                    double s = static_cast<uint8_t>(src[i]);
-                    return inter + slope * s;
-                };
-            }
-        }
-        else if (spp >= 3)
-        {
-            // 彩色：RGB / YBR_*   —— 转成灰度显示
-            if (is16)
-            {
-                const uint16_t *src = reinterpret_cast<const uint16_t *>(buffer.data());
-                fetch = [&](int i) -> double
-                {
-                    if (planar == 0)
-                    {
-                        // 交错：RGBRGB...
-                        int off = i * 3;
-                        double r = src[off + 0];
-                        double g = src[off + 1];
-                        double b = src[off + 2];
-                        double y = isYBR(pi) ? r : (0.299 * r + 0.587 * g + 0.114 * b); // YBR: 第一个分量是 Y
-                        return inter + slope * y;
-                    }
-                    else
-                    {
-                        // 平面：RRR... GGG... BBB...
-                        size_t plane = static_cast<size_t>(w) * static_cast<size_t>(h);
-                        double r = src[i];
-                        double g = src[i + plane];
-                        double b = src[i + 2 * plane];
-                        double y = isYBR(pi) ? r : (0.299 * r + 0.587 * g + 0.114 * b);
-                        return inter + slope * y;
-                    }
-                };
-            }
-            else
-            {
-                const uint8_t *src = reinterpret_cast<const uint8_t *>(buffer.data());
-                fetch = [&](int i) -> double
-                {
-                    if (planar == 0)
-                    {
-                        int off = i * 3;
-                        double r = src[off + 0];
-                        double g = src[off + 1];
-                        double b = src[off + 2];
-                        double y = isYBR(pi) ? r : (0.299 * r + 0.587 * g + 0.114 * b);
-                        return inter + slope * y;
-                    }
-                    else
-                    {
-                        size_t plane = static_cast<size_t>(w) * static_cast<size_t>(h);
-                        double r = src[i];
-                        double g = src[i + plane];
-                        double b = src[i + 2 * plane];
-                        double y = isYBR(pi) ? r : (0.299 * r + 0.587 * g + 0.114 * b);
-                        return inter + slope * y;
-                    }
-                };
-            }
-        }
-        else
-        {
-            // 其他稀有 spp，兜底按 1 通道处理
-            const uint8_t *src = reinterpret_cast<const uint8_t *>(buffer.data());
-            fetch = [&](int i) -> double
-            { return inter + slope * double(src[i]); };
+            double v = sampleAt(idx);
+            minSample = std::min(minSample, v);
+            maxSample = std::max(maxSample, v);
         }
 
-        // 无 WW 的情况下自动窗口
-        ensureWindow(fetch);
-
-        // WL 映射到 0..255
-        auto applyWL = [&](double val) -> uint8_t
+        double useWc = wc;
+        double useWw = ww;
+        if (!(useWw > 0.0))
         {
-            if (ww <= 0.0)
-            {
-                return static_cast<uint8_t>(std::clamp(val, 0.0, 255.0));
-            }
-            const double low = wc - ww / 2.0;
-            const double high = wc + ww / 2.0;
-            if (val <= low)
+            useWw = maxSample - minSample;
+            useWc = 0.5 * (maxSample + minSample);
+            if (!(useWw > 0.0))
+                useWw = 1.0;
+        }
+
+        const double low = useWc - useWw / 2.0;
+        const double high = useWc + useWw / 2.0;
+
+        auto mapToU8 = [&](double v) -> uint8_t
+        {
+            if (v <= low)
                 return 0;
-            if (val >= high)
+            if (v >= high)
                 return 255;
-            return static_cast<uint8_t>(std::lround(((val - low) / (high - low)) * 255.0));
+            double norm = (v - low) / (high - low);
+            int mapped = static_cast<int>(std::round(norm * 255.0));
+            return static_cast<uint8_t>(std::clamp(mapped, 0, 255));
         };
 
-        std::vector<uint8_t> outbuf(static_cast<size_t>(w) * static_cast<size_t>(h));
-        for (int i = 0; i < w * h; ++i)
-        {
-            outbuf[static_cast<size_t>(i)] = applyWL(fetch(i));
-        }
+        std::vector<uint8_t> outbuf(pixelCount);
+        for (size_t idx = 0; idx < pixelCount; ++idx)
+            outbuf[idx] = mapToU8(sampleAt(idx));
 
-        // MONOCHROME1 需要反色
         if (pi == gdcm::PhotometricInterpretation::MONOCHROME1)
         {
             for (auto &v : outbuf)
@@ -276,29 +292,25 @@ namespace DicomUtils
         }
 
         out = toQImage8bit(outbuf.data(), w, h);
+        // out = enhanceMonochrome(out);
+
+        SliceInfo sliceInfo;
+        sliceInfo.spacingX = 1.0;
+        sliceInfo.spacingY = 1.0;
+        sliceInfo.sliceLocation = 0.0;
+        sliceInfo.instanceNumber = 0;
+        sliceInfo.seriesInstanceUID.clear();
+        sliceInfo = extractSliceInfo(ds);
+        if (info)
+            *info = sliceInfo;
 
         // -------- 元数据（可选）--------
         if (meta)
         {
-            auto getStr = [&](uint16_t g, uint16_t e) -> QString
-            {
-                gdcm::Tag t(g, e);
-                if (!ds.FindDataElement(t))
-                    return {};
-                const gdcm::DataElement &de = ds.GetDataElement(t);
-                const gdcm::ByteValue *bv = de.GetByteValue();
-                if (!bv)
-                    return {};
-                std::string s(bv->GetPointer(), bv->GetLength());
-                while (!s.empty() && (s.back() == ' ' || s.back() == '\0' || s.back() == '\r' || s.back() == '\n'))
-                    s.pop_back();
-                return QString::fromStdString(s);
-            };
-
-            meta->insert("Modality", getStr(0x0008, 0x0060));
-            meta->insert("PatientName", getStr(0x0010, 0x0010));
-            meta->insert("StudyDate", getStr(0x0008, 0x0020));
-            meta->insert("SeriesDescription", getStr(0x0008, 0x103E));
+            meta->insert("Modality", readStringTag(ds, 0x0008, 0x0060));
+            meta->insert("PatientName", readStringTag(ds, 0x0010, 0x0010));
+            meta->insert("StudyDate", readStringTag(ds, 0x0008, 0x0020));
+            meta->insert("SeriesDescription", readStringTag(ds, 0x0008, 0x103E));
             meta->insert("WindowCenter", QString::number(wc));
             meta->insert("WindowWidth", QString::number(ww));
             meta->insert("RescaleSlope", QString::number(slope));
@@ -310,17 +322,42 @@ namespace DicomUtils
             meta->insert("PixelRepresentation", isSigned ? "SIGNED" : "UNSIGNED");
             meta->insert("Photometric", QString::fromLatin1(gdcm::PhotometricInterpretation::GetPIString(pi)));
             meta->insert("Path", path);
+            meta->insert("PixelSpacing", QString("%1 mm / %2 mm").arg(sliceInfo.spacingY, 0, 'f', 3).arg(sliceInfo.spacingX, 0, 'f', 3));
+            meta->insert("InstanceNumber", QString::number(sliceInfo.instanceNumber));
+            meta->insert("SliceLocation", QString::number(sliceInfo.sliceLocation, 'f', 3));
+            if (!sliceInfo.seriesInstanceUID.isEmpty())
+                meta->insert("SeriesInstanceUID", sliceInfo.seriesInstanceUID);
         }
 
         return true;
     }
 #else
-    bool loadDicomToQImage(const QString &path, QImage &out, QMap<QString, QString> *meta)
+    bool loadDicomToQImage(const QString &path, QImage &out, QMap<QString, QString> *meta, SliceInfo *info)
     {
         Q_UNUSED(path);
         Q_UNUSED(out);
+        Q_UNUSED(info);
         if (meta)
             meta->insert("Info", "Built without GDCM support");
+        return false;
+    }
+#endif
+
+#ifdef HAVE_GDCM
+    bool probeSliceInfo(const QString &path, SliceInfo &info)
+    {
+        gdcm::Reader reader;
+        reader.SetFileName(path.toStdString().c_str());
+        if (!reader.Read())
+            return false;
+        info = extractSliceInfo(reader.GetFile().GetDataSet());
+        return true;
+    }
+#else
+    bool probeSliceInfo(const QString &path, SliceInfo &info)
+    {
+        Q_UNUSED(path);
+        Q_UNUSED(info);
         return false;
     }
 #endif
